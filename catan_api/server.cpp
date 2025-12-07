@@ -716,6 +716,567 @@ std::string handleEndTurn(const HTTPRequest& req, const std::string& gameId) {
     return jsonResponse(200, json.str());
 }
 
+// ============================================================================
+// CHAT AND TRADE HANDLERS
+// ============================================================================
+
+std::string handleSendChat(const HTTPRequest& req, const std::string& gameId) {
+    GameContext ctx = getGameContext(req, gameId, false);  // Don't require turn
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    int toPlayerId = parseJsonInt(req.body, "toPlayerId", -1);
+    std::string message = parseJsonString(req.body, "message");
+    
+    if (message.empty()) {
+        return jsonResponse(400, "{\"error\":\"Message cannot be empty\"}");
+    }
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    // Create chat message
+    catan::ChatMessage chatMsg;
+    chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+    chatMsg.fromPlayerId = ctx.session->playerId;
+    chatMsg.toPlayerId = toPlayerId;
+    chatMsg.content = message;
+    chatMsg.type = catan::ChatMessageType::Normal;
+    chatMsg.timestamp = std::chrono::steady_clock::now();
+    
+    ctx.game->chatMessages.push_back(chatMsg);
+    
+    // Broadcast SSE event
+    catan::SSEEvent sseEvent = catan::GameEvents::createChatMessageEvent(
+        chatMsg.id,
+        chatMsg.fromPlayerId,
+        ctx.player->name,
+        chatMsg.toPlayerId,
+        chatMsg.content,
+        "normal"
+    );
+    catan::sseManager.broadcastToGame(gameId, sseEvent);
+    
+    return jsonResponse(200, 
+        "{\"success\":true,\"messageId\":\"" + chatMsg.id + "\"}");
+}
+
+std::string handleGetChatHistory(const HTTPRequest& req, const std::string& gameId) {
+    GameContext ctx = getGameContext(req, gameId, false);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    std::ostringstream json;
+    json << "{\"messages\":[";
+    
+    bool first = true;
+    for (const auto& msg : ctx.game->chatMessages) {
+        // Only show messages visible to this player
+        if (msg.toPlayerId == -1 || msg.toPlayerId == ctx.session->playerId || 
+            msg.fromPlayerId == ctx.session->playerId) {
+            if (!first) json << ",";
+            first = false;
+            
+            std::string senderName = "System";
+            if (msg.fromPlayerId >= 0 && msg.fromPlayerId < (int)ctx.game->players.size()) {
+                senderName = ctx.game->players[msg.fromPlayerId].name;
+            }
+            
+            std::string typeStr = "normal";
+            switch (msg.type) {
+                case catan::ChatMessageType::Normal: typeStr = "normal"; break;
+                case catan::ChatMessageType::TradeProposal: typeStr = "trade_proposal"; break;
+                case catan::ChatMessageType::TradeAccept: typeStr = "trade_accept"; break;
+                case catan::ChatMessageType::TradeReject: typeStr = "trade_reject"; break;
+                case catan::ChatMessageType::TradeCounter: typeStr = "trade_counter"; break;
+                case catan::ChatMessageType::System: typeStr = "system"; break;
+            }
+            
+            // Escape content
+            std::string escapedContent;
+            for (char c : msg.content) {
+                if (c == '"') escapedContent += "\\\"";
+                else if (c == '\\') escapedContent += "\\\\";
+                else if (c == '\n') escapedContent += "\\n";
+                else escapedContent += c;
+            }
+            
+            json << "{\"id\":\"" << msg.id << "\"";
+            json << ",\"fromPlayerId\":" << msg.fromPlayerId;
+            json << ",\"fromPlayerName\":\"" << senderName << "\"";
+            json << ",\"toPlayerId\":" << msg.toPlayerId;
+            json << ",\"content\":\"" << escapedContent << "\"";
+            json << ",\"type\":\"" << typeStr << "\"";
+            json << ",\"relatedTradeId\":" << msg.relatedTradeId;
+            json << "}";
+        }
+    }
+    
+    json << "]}";
+    return jsonResponse(200, json.str());
+}
+
+std::string handleProposeTrade(const HTTPRequest& req, const std::string& gameId) {
+    GameContext ctx = getGameContext(req, gameId, false);  // Any player can propose
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    int toPlayerId = parseJsonInt(req.body, "toPlayerId", -1);
+    std::string message = parseJsonString(req.body, "message");
+    
+    // Parse offering resources
+    catan::ResourceHand offering;
+    offering.wood = parseJsonInt(req.body, "giveWood", 0);
+    offering.brick = parseJsonInt(req.body, "giveBrick", 0);
+    offering.wheat = parseJsonInt(req.body, "giveWheat", 0);
+    offering.sheep = parseJsonInt(req.body, "giveSheep", 0);
+    offering.ore = parseJsonInt(req.body, "giveOre", 0);
+    
+    // Parse requesting resources
+    catan::ResourceHand requesting;
+    requesting.wood = parseJsonInt(req.body, "wantWood", 0);
+    requesting.brick = parseJsonInt(req.body, "wantBrick", 0);
+    requesting.wheat = parseJsonInt(req.body, "wantWheat", 0);
+    requesting.sheep = parseJsonInt(req.body, "wantSheep", 0);
+    requesting.ore = parseJsonInt(req.body, "wantOre", 0);
+    
+    // Validate player has resources to offer
+    if (ctx.player->resources.wood < offering.wood ||
+        ctx.player->resources.brick < offering.brick ||
+        ctx.player->resources.wheat < offering.wheat ||
+        ctx.player->resources.sheep < offering.sheep ||
+        ctx.player->resources.ore < offering.ore) {
+        return jsonResponse(400, "{\"error\":\"You don't have enough resources to offer\"}");
+    }
+    
+    // Create trade offer
+    catan::TradeOffer trade;
+    trade.id = ctx.game->nextTradeId++;
+    trade.fromPlayerId = ctx.session->playerId;
+    trade.toPlayerId = toPlayerId;
+    trade.offering = offering;
+    trade.requesting = requesting;
+    trade.isActive = true;
+    
+    // Create accompanying chat message
+    catan::ChatMessage chatMsg;
+    chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+    chatMsg.fromPlayerId = ctx.session->playerId;
+    chatMsg.toPlayerId = toPlayerId;
+    chatMsg.type = catan::ChatMessageType::TradeProposal;
+    chatMsg.relatedTradeId = trade.id;
+    chatMsg.tradeOffering = offering;
+    chatMsg.tradeRequesting = requesting;
+    chatMsg.timestamp = std::chrono::steady_clock::now();
+    
+    // Build trade description message
+    std::ostringstream tradeDesc;
+    tradeDesc << "📦 Trade Proposal: Offering ";
+    bool firstOffer = true;
+    if (offering.wood > 0) { tradeDesc << offering.wood << " wood"; firstOffer = false; }
+    if (offering.brick > 0) { tradeDesc << (firstOffer ? "" : ", ") << offering.brick << " brick"; firstOffer = false; }
+    if (offering.wheat > 0) { tradeDesc << (firstOffer ? "" : ", ") << offering.wheat << " wheat"; firstOffer = false; }
+    if (offering.sheep > 0) { tradeDesc << (firstOffer ? "" : ", ") << offering.sheep << " sheep"; firstOffer = false; }
+    if (offering.ore > 0) { tradeDesc << (firstOffer ? "" : ", ") << offering.ore << " ore"; firstOffer = false; }
+    tradeDesc << " for ";
+    bool firstReq = true;
+    if (requesting.wood > 0) { tradeDesc << requesting.wood << " wood"; firstReq = false; }
+    if (requesting.brick > 0) { tradeDesc << (firstReq ? "" : ", ") << requesting.brick << " brick"; firstReq = false; }
+    if (requesting.wheat > 0) { tradeDesc << (firstReq ? "" : ", ") << requesting.wheat << " wheat"; firstReq = false; }
+    if (requesting.sheep > 0) { tradeDesc << (firstReq ? "" : ", ") << requesting.sheep << " sheep"; firstReq = false; }
+    if (requesting.ore > 0) { tradeDesc << (firstReq ? "" : ", ") << requesting.ore << " ore"; firstReq = false; }
+    if (!message.empty()) {
+        tradeDesc << " - \"" << message << "\"";
+    }
+    chatMsg.content = tradeDesc.str();
+    
+    trade.chatMessageId = chatMsg.id;
+    
+    ctx.game->tradeOffers.push_back(trade);
+    ctx.game->chatMessages.push_back(chatMsg);
+    
+    // Broadcast SSE events
+    catan::SSEEvent chatEvent = catan::GameEvents::createChatMessageEvent(
+        chatMsg.id, chatMsg.fromPlayerId, ctx.player->name,
+        chatMsg.toPlayerId, chatMsg.content, "trade_proposal"
+    );
+    catan::sseManager.broadcastToGame(gameId, chatEvent);
+    
+    catan::SSEEvent tradeEvent = catan::GameEvents::createTradeProposedEvent(
+        trade.id, trade.fromPlayerId, ctx.player->name, trade.toPlayerId,
+        offering.wood, offering.brick, offering.wheat, offering.sheep, offering.ore,
+        requesting.wood, requesting.brick, requesting.wheat, requesting.sheep, requesting.ore,
+        message
+    );
+    catan::sseManager.broadcastToGame(gameId, tradeEvent);
+    
+    return jsonResponse(200, 
+        "{\"success\":true,\"tradeId\":" + std::to_string(trade.id) + 
+        ",\"messageId\":\"" + chatMsg.id + "\"}");
+}
+
+std::string handleAcceptTrade(const HTTPRequest& req, const std::string& gameId, int tradeId) {
+    GameContext ctx = getGameContext(req, gameId, false);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    // Find the trade
+    catan::TradeOffer* trade = nullptr;
+    for (auto& t : ctx.game->tradeOffers) {
+        if (t.id == tradeId) {
+            trade = &t;
+            break;
+        }
+    }
+    
+    if (!trade) {
+        return jsonResponse(404, "{\"error\":\"Trade not found\"}");
+    }
+    
+    if (!trade->isActive) {
+        return jsonResponse(400, "{\"error\":\"Trade is no longer active\"}");
+    }
+    
+    if (trade->fromPlayerId == ctx.session->playerId) {
+        return jsonResponse(400, "{\"error\":\"Cannot accept your own trade\"}");
+    }
+    
+    // Check if trade is open or directed to this player
+    if (trade->toPlayerId != -1 && trade->toPlayerId != ctx.session->playerId) {
+        return jsonResponse(400, "{\"error\":\"This trade is not for you\"}");
+    }
+    
+    // Verify accepting player has resources
+    if (ctx.player->resources.wood < trade->requesting.wood ||
+        ctx.player->resources.brick < trade->requesting.brick ||
+        ctx.player->resources.wheat < trade->requesting.wheat ||
+        ctx.player->resources.sheep < trade->requesting.sheep ||
+        ctx.player->resources.ore < trade->requesting.ore) {
+        return jsonResponse(400, "{\"error\":\"You don't have enough resources\"}");
+    }
+    
+    // Verify proposer still has resources
+    catan::Player* proposer = ctx.game->getPlayerById(trade->fromPlayerId);
+    if (!proposer ||
+        proposer->resources.wood < trade->offering.wood ||
+        proposer->resources.brick < trade->offering.brick ||
+        proposer->resources.wheat < trade->offering.wheat ||
+        proposer->resources.sheep < trade->offering.sheep ||
+        proposer->resources.ore < trade->offering.ore) {
+        trade->isActive = false;
+        return jsonResponse(400, "{\"error\":\"Proposer no longer has the resources\"}");
+    }
+    
+    // Execute the trade!
+    // Proposer gives, acceptor receives
+    proposer->resources.wood -= trade->offering.wood;
+    proposer->resources.brick -= trade->offering.brick;
+    proposer->resources.wheat -= trade->offering.wheat;
+    proposer->resources.sheep -= trade->offering.sheep;
+    proposer->resources.ore -= trade->offering.ore;
+    
+    ctx.player->resources.wood += trade->offering.wood;
+    ctx.player->resources.brick += trade->offering.brick;
+    ctx.player->resources.wheat += trade->offering.wheat;
+    ctx.player->resources.sheep += trade->offering.sheep;
+    ctx.player->resources.ore += trade->offering.ore;
+    
+    // Acceptor gives, proposer receives
+    ctx.player->resources.wood -= trade->requesting.wood;
+    ctx.player->resources.brick -= trade->requesting.brick;
+    ctx.player->resources.wheat -= trade->requesting.wheat;
+    ctx.player->resources.sheep -= trade->requesting.sheep;
+    ctx.player->resources.ore -= trade->requesting.ore;
+    
+    proposer->resources.wood += trade->requesting.wood;
+    proposer->resources.brick += trade->requesting.brick;
+    proposer->resources.wheat += trade->requesting.wheat;
+    proposer->resources.sheep += trade->requesting.sheep;
+    proposer->resources.ore += trade->requesting.ore;
+    
+    // Mark trade as completed
+    trade->isActive = false;
+    trade->acceptedByPlayerIds.push_back(ctx.session->playerId);
+    
+    // Create chat message about accepted trade
+    catan::ChatMessage chatMsg;
+    chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+    chatMsg.fromPlayerId = ctx.session->playerId;
+    chatMsg.toPlayerId = -1;  // Public announcement
+    chatMsg.type = catan::ChatMessageType::TradeAccept;
+    chatMsg.relatedTradeId = trade->id;
+    chatMsg.content = "✅ " + ctx.player->name + " accepted the trade with " + proposer->name + "!";
+    chatMsg.timestamp = std::chrono::steady_clock::now();
+    ctx.game->chatMessages.push_back(chatMsg);
+    
+    // Broadcast SSE events
+    catan::SSEEvent acceptEvent = catan::GameEvents::createTradeResponseEvent(
+        catan::GameEvents::TRADE_ACCEPTED, trade->id, ctx.session->playerId, ctx.player->name
+    );
+    catan::sseManager.broadcastToGame(gameId, acceptEvent);
+    
+    catan::SSEEvent execEvent = catan::GameEvents::createTradeExecutedEvent(
+        trade->id, trade->fromPlayerId, proposer->name, ctx.session->playerId, ctx.player->name
+    );
+    catan::sseManager.broadcastToGame(gameId, execEvent);
+    
+    catan::SSEEvent chatEvent = catan::GameEvents::createChatMessageEvent(
+        chatMsg.id, chatMsg.fromPlayerId, ctx.player->name,
+        chatMsg.toPlayerId, chatMsg.content, "trade_accept"
+    );
+    catan::sseManager.broadcastToGame(gameId, chatEvent);
+    
+    return jsonResponse(200, "{\"success\":true,\"tradeId\":" + std::to_string(trade->id) + 
+        ",\"executed\":true}");
+}
+
+std::string handleRejectTrade(const HTTPRequest& req, const std::string& gameId, int tradeId) {
+    GameContext ctx = getGameContext(req, gameId, false);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    // Find the trade
+    catan::TradeOffer* trade = nullptr;
+    for (auto& t : ctx.game->tradeOffers) {
+        if (t.id == tradeId) {
+            trade = &t;
+            break;
+        }
+    }
+    
+    if (!trade) {
+        return jsonResponse(404, "{\"error\":\"Trade not found\"}");
+    }
+    
+    if (!trade->isActive) {
+        return jsonResponse(400, "{\"error\":\"Trade is no longer active\"}");
+    }
+    
+    // Record rejection
+    trade->rejectedByPlayerIds.push_back(ctx.session->playerId);
+    
+    // Create chat message
+    catan::ChatMessage chatMsg;
+    chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+    chatMsg.fromPlayerId = ctx.session->playerId;
+    chatMsg.toPlayerId = -1;
+    chatMsg.type = catan::ChatMessageType::TradeReject;
+    chatMsg.relatedTradeId = trade->id;
+    chatMsg.content = "❌ " + ctx.player->name + " rejected the trade.";
+    chatMsg.timestamp = std::chrono::steady_clock::now();
+    ctx.game->chatMessages.push_back(chatMsg);
+    
+    // Broadcast SSE events
+    catan::SSEEvent rejectEvent = catan::GameEvents::createTradeResponseEvent(
+        catan::GameEvents::TRADE_REJECTED, trade->id, ctx.session->playerId, ctx.player->name
+    );
+    catan::sseManager.broadcastToGame(gameId, rejectEvent);
+    
+    catan::SSEEvent chatEvent = catan::GameEvents::createChatMessageEvent(
+        chatMsg.id, chatMsg.fromPlayerId, ctx.player->name,
+        chatMsg.toPlayerId, chatMsg.content, "trade_reject"
+    );
+    catan::sseManager.broadcastToGame(gameId, chatEvent);
+    
+    return jsonResponse(200, "{\"success\":true}");
+}
+
+std::string handleCounterTrade(const HTTPRequest& req, const std::string& gameId, int originalTradeId) {
+    GameContext ctx = getGameContext(req, gameId, false);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    // Find the original trade
+    catan::TradeOffer* originalTrade = nullptr;
+    for (auto& t : ctx.game->tradeOffers) {
+        if (t.id == originalTradeId) {
+            originalTrade = &t;
+            break;
+        }
+    }
+    
+    if (!originalTrade) {
+        return jsonResponse(404, "{\"error\":\"Original trade not found\"}");
+    }
+    
+    std::string message = parseJsonString(req.body, "message");
+    
+    // Parse counter-offer resources
+    catan::ResourceHand offering;
+    offering.wood = parseJsonInt(req.body, "giveWood", 0);
+    offering.brick = parseJsonInt(req.body, "giveBrick", 0);
+    offering.wheat = parseJsonInt(req.body, "giveWheat", 0);
+    offering.sheep = parseJsonInt(req.body, "giveSheep", 0);
+    offering.ore = parseJsonInt(req.body, "giveOre", 0);
+    
+    catan::ResourceHand requesting;
+    requesting.wood = parseJsonInt(req.body, "wantWood", 0);
+    requesting.brick = parseJsonInt(req.body, "wantBrick", 0);
+    requesting.wheat = parseJsonInt(req.body, "wantWheat", 0);
+    requesting.sheep = parseJsonInt(req.body, "wantSheep", 0);
+    requesting.ore = parseJsonInt(req.body, "wantOre", 0);
+    
+    // Validate resources
+    if (ctx.player->resources.wood < offering.wood ||
+        ctx.player->resources.brick < offering.brick ||
+        ctx.player->resources.wheat < offering.wheat ||
+        ctx.player->resources.sheep < offering.sheep ||
+        ctx.player->resources.ore < offering.ore) {
+        return jsonResponse(400, "{\"error\":\"You don't have enough resources\"}");
+    }
+    
+    // Create new counter trade
+    catan::TradeOffer counterTrade;
+    counterTrade.id = ctx.game->nextTradeId++;
+    counterTrade.fromPlayerId = ctx.session->playerId;
+    counterTrade.toPlayerId = originalTrade->fromPlayerId;  // Counter goes to original proposer
+    counterTrade.offering = offering;
+    counterTrade.requesting = requesting;
+    counterTrade.isActive = true;
+    
+    // Create chat message
+    catan::ChatMessage chatMsg;
+    chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+    chatMsg.fromPlayerId = ctx.session->playerId;
+    chatMsg.toPlayerId = originalTrade->fromPlayerId;
+    chatMsg.type = catan::ChatMessageType::TradeCounter;
+    chatMsg.relatedTradeId = counterTrade.id;
+    chatMsg.tradeOffering = offering;
+    chatMsg.tradeRequesting = requesting;
+    chatMsg.timestamp = std::chrono::steady_clock::now();
+    
+    std::ostringstream desc;
+    desc << "🔄 Counter-offer to Trade #" << originalTradeId << ": ";
+    // ... build description similar to propose
+    if (!message.empty()) {
+        desc << "\"" << message << "\"";
+    }
+    chatMsg.content = desc.str();
+    
+    counterTrade.chatMessageId = chatMsg.id;
+    ctx.game->tradeOffers.push_back(counterTrade);
+    ctx.game->chatMessages.push_back(chatMsg);
+    
+    // Broadcast events
+    catan::SSEEvent counterEvent = catan::GameEvents::createTradeResponseEvent(
+        catan::GameEvents::TRADE_COUNTERED, originalTradeId, ctx.session->playerId, ctx.player->name
+    );
+    catan::sseManager.broadcastToGame(gameId, counterEvent);
+    
+    catan::SSEEvent tradeEvent = catan::GameEvents::createTradeProposedEvent(
+        counterTrade.id, counterTrade.fromPlayerId, ctx.player->name, counterTrade.toPlayerId,
+        offering.wood, offering.brick, offering.wheat, offering.sheep, offering.ore,
+        requesting.wood, requesting.brick, requesting.wheat, requesting.sheep, requesting.ore,
+        message
+    );
+    catan::sseManager.broadcastToGame(gameId, tradeEvent);
+    
+    return jsonResponse(200, 
+        "{\"success\":true,\"counterTradeId\":" + std::to_string(counterTrade.id) + "}");
+}
+
+std::string handleCancelTrade(const HTTPRequest& req, const std::string& gameId, int tradeId) {
+    GameContext ctx = getGameContext(req, gameId, false);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    // Find the trade
+    catan::TradeOffer* trade = nullptr;
+    for (auto& t : ctx.game->tradeOffers) {
+        if (t.id == tradeId) {
+            trade = &t;
+            break;
+        }
+    }
+    
+    if (!trade) {
+        return jsonResponse(404, "{\"error\":\"Trade not found\"}");
+    }
+    
+    // Only proposer can cancel
+    if (trade->fromPlayerId != ctx.session->playerId) {
+        return jsonResponse(403, "{\"error\":\"Only the proposer can cancel this trade\"}");
+    }
+    
+    if (!trade->isActive) {
+        return jsonResponse(400, "{\"error\":\"Trade is already inactive\"}");
+    }
+    
+    trade->isActive = false;
+    
+    // Create chat message
+    catan::ChatMessage chatMsg;
+    chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+    chatMsg.fromPlayerId = ctx.session->playerId;
+    chatMsg.toPlayerId = -1;
+    chatMsg.type = catan::ChatMessageType::System;
+    chatMsg.relatedTradeId = trade->id;
+    chatMsg.content = "🚫 " + ctx.player->name + " cancelled their trade offer.";
+    chatMsg.timestamp = std::chrono::steady_clock::now();
+    ctx.game->chatMessages.push_back(chatMsg);
+    
+    // Broadcast SSE events
+    catan::SSEEvent cancelEvent;
+    cancelEvent.event = catan::GameEvents::TRADE_CANCELLED;
+    cancelEvent.data = "{\"tradeId\":" + std::to_string(trade->id) + "}";
+    cancelEvent.id = catan::sseManager.nextEventId();
+    catan::sseManager.broadcastToGame(gameId, cancelEvent);
+    
+    return jsonResponse(200, "{\"success\":true}");
+}
+
+std::string handleGetActiveTrades(const HTTPRequest& req, const std::string& gameId) {
+    GameContext ctx = getGameContext(req, gameId, false);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    std::ostringstream json;
+    json << "{\"trades\":[";
+    
+    bool first = true;
+    for (const auto& trade : ctx.game->tradeOffers) {
+        // Show if active and visible to this player
+        if (trade.isActive && 
+            (trade.toPlayerId == -1 || trade.toPlayerId == ctx.session->playerId || 
+             trade.fromPlayerId == ctx.session->playerId)) {
+            if (!first) json << ",";
+            first = false;
+            
+            std::string fromName = "Unknown";
+            if (trade.fromPlayerId >= 0 && trade.fromPlayerId < (int)ctx.game->players.size()) {
+                fromName = ctx.game->players[trade.fromPlayerId].name;
+            }
+            
+            json << "{\"id\":" << trade.id;
+            json << ",\"fromPlayerId\":" << trade.fromPlayerId;
+            json << ",\"fromPlayerName\":\"" << fromName << "\"";
+            json << ",\"toPlayerId\":" << trade.toPlayerId;
+            json << ",\"offering\":{";
+            json << "\"wood\":" << trade.offering.wood;
+            json << ",\"brick\":" << trade.offering.brick;
+            json << ",\"wheat\":" << trade.offering.wheat;
+            json << ",\"sheep\":" << trade.offering.sheep;
+            json << ",\"ore\":" << trade.offering.ore << "}";
+            json << ",\"requesting\":{";
+            json << "\"wood\":" << trade.requesting.wood;
+            json << ",\"brick\":" << trade.requesting.brick;
+            json << ",\"wheat\":" << trade.requesting.wheat;
+            json << ",\"sheep\":" << trade.requesting.sheep;
+            json << ",\"ore\":" << trade.requesting.ore << "}";
+            json << ",\"isActive\":" << (trade.isActive ? "true" : "false");
+            json << "}";
+        }
+    }
+    
+    json << "]}";
+    return jsonResponse(200, json.str());
+}
+
 std::string handleStartGame(const HTTPRequest& req, const std::string& gameId) {
     GameContext ctx = getGameContext(req, gameId, false); // Don't require current turn
     if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
@@ -1097,6 +1658,349 @@ std::string handleExecuteAITool(const HTTPRequest& req, const std::string& gameI
             ",\"stolenResource\":\"" + stolenResource + "\"}");
     }
     
+    // ============ CHAT AND TRADE TOOLS ============
+    
+    if (toolName == "send_chat") {
+        int toPlayerId = parseJsonInt(req.body, "toPlayerId", -1);
+        std::string message = parseJsonString(req.body, "message");
+        
+        if (message.empty()) {
+            return jsonResponse(400, "{\"error\":\"Message cannot be empty\"}");
+        }
+        
+        // Create chat message
+        catan::ChatMessage chatMsg;
+        chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+        chatMsg.fromPlayerId = ctx.session->playerId;
+        chatMsg.toPlayerId = toPlayerId;
+        chatMsg.content = message;
+        chatMsg.type = catan::ChatMessageType::Normal;
+        chatMsg.timestamp = std::chrono::steady_clock::now();
+        
+        ctx.game->chatMessages.push_back(chatMsg);
+        
+        // Broadcast SSE event
+        catan::SSEEvent sseEvent = catan::GameEvents::createChatMessageEvent(
+            chatMsg.id, chatMsg.fromPlayerId, ctx.player->name,
+            chatMsg.toPlayerId, chatMsg.content, "normal"
+        );
+        catan::sseManager.broadcastToGame(gameId, sseEvent);
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"send_chat\",\"messageId\":\"" + chatMsg.id + "\"}");
+    }
+    
+    if (toolName == "propose_trade") {
+        int toPlayerId = parseJsonInt(req.body, "toPlayerId", -1);
+        std::string message = parseJsonString(req.body, "message");
+        
+        catan::ResourceHand offering;
+        offering.wood = parseJsonInt(req.body, "giveWood", 0);
+        offering.brick = parseJsonInt(req.body, "giveBrick", 0);
+        offering.wheat = parseJsonInt(req.body, "giveWheat", 0);
+        offering.sheep = parseJsonInt(req.body, "giveSheep", 0);
+        offering.ore = parseJsonInt(req.body, "giveOre", 0);
+        
+        catan::ResourceHand requesting;
+        requesting.wood = parseJsonInt(req.body, "wantWood", 0);
+        requesting.brick = parseJsonInt(req.body, "wantBrick", 0);
+        requesting.wheat = parseJsonInt(req.body, "wantWheat", 0);
+        requesting.sheep = parseJsonInt(req.body, "wantSheep", 0);
+        requesting.ore = parseJsonInt(req.body, "wantOre", 0);
+        
+        // Validate
+        if (ctx.player->resources.wood < offering.wood ||
+            ctx.player->resources.brick < offering.brick ||
+            ctx.player->resources.wheat < offering.wheat ||
+            ctx.player->resources.sheep < offering.sheep ||
+            ctx.player->resources.ore < offering.ore) {
+            return jsonResponse(400, "{\"error\":\"Not enough resources to offer\"}");
+        }
+        
+        // Create trade
+        catan::TradeOffer trade;
+        trade.id = ctx.game->nextTradeId++;
+        trade.fromPlayerId = ctx.session->playerId;
+        trade.toPlayerId = toPlayerId;
+        trade.offering = offering;
+        trade.requesting = requesting;
+        trade.isActive = true;
+        
+        // Create chat message
+        catan::ChatMessage chatMsg;
+        chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+        chatMsg.fromPlayerId = ctx.session->playerId;
+        chatMsg.toPlayerId = toPlayerId;
+        chatMsg.type = catan::ChatMessageType::TradeProposal;
+        chatMsg.relatedTradeId = trade.id;
+        chatMsg.timestamp = std::chrono::steady_clock::now();
+        
+        std::ostringstream desc;
+        desc << "📦 Trade Proposal: ";
+        if (!message.empty()) desc << message << " - ";
+        desc << "Offering ";
+        bool first = true;
+        if (offering.wood > 0) { desc << offering.wood << " wood"; first = false; }
+        if (offering.brick > 0) { desc << (first ? "" : ", ") << offering.brick << " brick"; first = false; }
+        if (offering.wheat > 0) { desc << (first ? "" : ", ") << offering.wheat << " wheat"; first = false; }
+        if (offering.sheep > 0) { desc << (first ? "" : ", ") << offering.sheep << " sheep"; first = false; }
+        if (offering.ore > 0) { desc << (first ? "" : ", ") << offering.ore << " ore"; first = false; }
+        desc << " for ";
+        first = true;
+        if (requesting.wood > 0) { desc << requesting.wood << " wood"; first = false; }
+        if (requesting.brick > 0) { desc << (first ? "" : ", ") << requesting.brick << " brick"; first = false; }
+        if (requesting.wheat > 0) { desc << (first ? "" : ", ") << requesting.wheat << " wheat"; first = false; }
+        if (requesting.sheep > 0) { desc << (first ? "" : ", ") << requesting.sheep << " sheep"; first = false; }
+        if (requesting.ore > 0) { desc << (first ? "" : ", ") << requesting.ore << " ore"; first = false; }
+        chatMsg.content = desc.str();
+        
+        trade.chatMessageId = chatMsg.id;
+        ctx.game->tradeOffers.push_back(trade);
+        ctx.game->chatMessages.push_back(chatMsg);
+        
+        // Broadcast
+        catan::SSEEvent chatEvent = catan::GameEvents::createChatMessageEvent(
+            chatMsg.id, chatMsg.fromPlayerId, ctx.player->name,
+            chatMsg.toPlayerId, chatMsg.content, "trade_proposal"
+        );
+        catan::sseManager.broadcastToGame(gameId, chatEvent);
+        
+        catan::SSEEvent tradeEvent = catan::GameEvents::createTradeProposedEvent(
+            trade.id, trade.fromPlayerId, ctx.player->name, trade.toPlayerId,
+            offering.wood, offering.brick, offering.wheat, offering.sheep, offering.ore,
+            requesting.wood, requesting.brick, requesting.wheat, requesting.sheep, requesting.ore,
+            message
+        );
+        catan::sseManager.broadcastToGame(gameId, tradeEvent);
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"propose_trade\",\"tradeId\":" + std::to_string(trade.id) + "}");
+    }
+    
+    if (toolName == "accept_trade") {
+        int tradeId = parseJsonInt(req.body, "tradeId", -1);
+        
+        catan::TradeOffer* trade = nullptr;
+        for (auto& t : ctx.game->tradeOffers) {
+            if (t.id == tradeId) {
+                trade = &t;
+                break;
+            }
+        }
+        
+        if (!trade) {
+            return jsonResponse(400, "{\"error\":\"Trade not found\"}");
+        }
+        
+        if (!trade->isActive) {
+            return jsonResponse(400, "{\"error\":\"Trade no longer active\"}");
+        }
+        
+        if (trade->fromPlayerId == ctx.session->playerId) {
+            return jsonResponse(400, "{\"error\":\"Cannot accept own trade\"}");
+        }
+        
+        // Verify resources
+        if (ctx.player->resources.wood < trade->requesting.wood ||
+            ctx.player->resources.brick < trade->requesting.brick ||
+            ctx.player->resources.wheat < trade->requesting.wheat ||
+            ctx.player->resources.sheep < trade->requesting.sheep ||
+            ctx.player->resources.ore < trade->requesting.ore) {
+            return jsonResponse(400, "{\"error\":\"Not enough resources\"}");
+        }
+        
+        catan::Player* proposer = ctx.game->getPlayerById(trade->fromPlayerId);
+        if (!proposer ||
+            proposer->resources.wood < trade->offering.wood ||
+            proposer->resources.brick < trade->offering.brick ||
+            proposer->resources.wheat < trade->offering.wheat ||
+            proposer->resources.sheep < trade->offering.sheep ||
+            proposer->resources.ore < trade->offering.ore) {
+            trade->isActive = false;
+            return jsonResponse(400, "{\"error\":\"Proposer no longer has resources\"}");
+        }
+        
+        // Execute trade
+        proposer->resources.wood -= trade->offering.wood;
+        proposer->resources.brick -= trade->offering.brick;
+        proposer->resources.wheat -= trade->offering.wheat;
+        proposer->resources.sheep -= trade->offering.sheep;
+        proposer->resources.ore -= trade->offering.ore;
+        
+        ctx.player->resources.wood += trade->offering.wood;
+        ctx.player->resources.brick += trade->offering.brick;
+        ctx.player->resources.wheat += trade->offering.wheat;
+        ctx.player->resources.sheep += trade->offering.sheep;
+        ctx.player->resources.ore += trade->offering.ore;
+        
+        ctx.player->resources.wood -= trade->requesting.wood;
+        ctx.player->resources.brick -= trade->requesting.brick;
+        ctx.player->resources.wheat -= trade->requesting.wheat;
+        ctx.player->resources.sheep -= trade->requesting.sheep;
+        ctx.player->resources.ore -= trade->requesting.ore;
+        
+        proposer->resources.wood += trade->requesting.wood;
+        proposer->resources.brick += trade->requesting.brick;
+        proposer->resources.wheat += trade->requesting.wheat;
+        proposer->resources.sheep += trade->requesting.sheep;
+        proposer->resources.ore += trade->requesting.ore;
+        
+        trade->isActive = false;
+        trade->acceptedByPlayerIds.push_back(ctx.session->playerId);
+        
+        // Chat message
+        catan::ChatMessage chatMsg;
+        chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+        chatMsg.fromPlayerId = ctx.session->playerId;
+        chatMsg.toPlayerId = -1;
+        chatMsg.type = catan::ChatMessageType::TradeAccept;
+        chatMsg.relatedTradeId = trade->id;
+        chatMsg.content = "✅ " + ctx.player->name + " accepted the trade with " + proposer->name + "!";
+        chatMsg.timestamp = std::chrono::steady_clock::now();
+        ctx.game->chatMessages.push_back(chatMsg);
+        
+        // Broadcast
+        catan::SSEEvent execEvent = catan::GameEvents::createTradeExecutedEvent(
+            trade->id, trade->fromPlayerId, proposer->name, ctx.session->playerId, ctx.player->name
+        );
+        catan::sseManager.broadcastToGame(gameId, execEvent);
+        
+        catan::SSEEvent chatEvent = catan::GameEvents::createChatMessageEvent(
+            chatMsg.id, chatMsg.fromPlayerId, ctx.player->name,
+            chatMsg.toPlayerId, chatMsg.content, "trade_accept"
+        );
+        catan::sseManager.broadcastToGame(gameId, chatEvent);
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"accept_trade\",\"executed\":true}");
+    }
+    
+    if (toolName == "reject_trade") {
+        int tradeId = parseJsonInt(req.body, "tradeId", -1);
+        
+        catan::TradeOffer* trade = nullptr;
+        for (auto& t : ctx.game->tradeOffers) {
+            if (t.id == tradeId) {
+                trade = &t;
+                break;
+            }
+        }
+        
+        if (!trade) {
+            return jsonResponse(400, "{\"error\":\"Trade not found\"}");
+        }
+        
+        trade->rejectedByPlayerIds.push_back(ctx.session->playerId);
+        
+        // Chat message
+        catan::ChatMessage chatMsg;
+        chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+        chatMsg.fromPlayerId = ctx.session->playerId;
+        chatMsg.toPlayerId = -1;
+        chatMsg.type = catan::ChatMessageType::TradeReject;
+        chatMsg.relatedTradeId = trade->id;
+        chatMsg.content = "❌ " + ctx.player->name + " rejected the trade.";
+        chatMsg.timestamp = std::chrono::steady_clock::now();
+        ctx.game->chatMessages.push_back(chatMsg);
+        
+        catan::SSEEvent chatEvent = catan::GameEvents::createChatMessageEvent(
+            chatMsg.id, chatMsg.fromPlayerId, ctx.player->name,
+            chatMsg.toPlayerId, chatMsg.content, "trade_reject"
+        );
+        catan::sseManager.broadcastToGame(gameId, chatEvent);
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"reject_trade\"}");
+    }
+    
+    if (toolName == "counter_trade") {
+        int originalTradeId = parseJsonInt(req.body, "originalTradeId", -1);
+        std::string message = parseJsonString(req.body, "message");
+        
+        catan::TradeOffer* originalTrade = nullptr;
+        for (auto& t : ctx.game->tradeOffers) {
+            if (t.id == originalTradeId) {
+                originalTrade = &t;
+                break;
+            }
+        }
+        
+        if (!originalTrade) {
+            return jsonResponse(400, "{\"error\":\"Original trade not found\"}");
+        }
+        
+        catan::ResourceHand offering;
+        offering.wood = parseJsonInt(req.body, "giveWood", 0);
+        offering.brick = parseJsonInt(req.body, "giveBrick", 0);
+        offering.wheat = parseJsonInt(req.body, "giveWheat", 0);
+        offering.sheep = parseJsonInt(req.body, "giveSheep", 0);
+        offering.ore = parseJsonInt(req.body, "giveOre", 0);
+        
+        catan::ResourceHand requesting;
+        requesting.wood = parseJsonInt(req.body, "wantWood", 0);
+        requesting.brick = parseJsonInt(req.body, "wantBrick", 0);
+        requesting.wheat = parseJsonInt(req.body, "wantWheat", 0);
+        requesting.sheep = parseJsonInt(req.body, "wantSheep", 0);
+        requesting.ore = parseJsonInt(req.body, "wantOre", 0);
+        
+        if (ctx.player->resources.wood < offering.wood ||
+            ctx.player->resources.brick < offering.brick ||
+            ctx.player->resources.wheat < offering.wheat ||
+            ctx.player->resources.sheep < offering.sheep ||
+            ctx.player->resources.ore < offering.ore) {
+            return jsonResponse(400, "{\"error\":\"Not enough resources\"}");
+        }
+        
+        // Create counter trade
+        catan::TradeOffer counterTrade;
+        counterTrade.id = ctx.game->nextTradeId++;
+        counterTrade.fromPlayerId = ctx.session->playerId;
+        counterTrade.toPlayerId = originalTrade->fromPlayerId;
+        counterTrade.offering = offering;
+        counterTrade.requesting = requesting;
+        counterTrade.isActive = true;
+        
+        // Chat message
+        catan::ChatMessage chatMsg;
+        chatMsg.id = std::to_string(ctx.game->nextChatMessageId++);
+        chatMsg.fromPlayerId = ctx.session->playerId;
+        chatMsg.toPlayerId = originalTrade->fromPlayerId;
+        chatMsg.type = catan::ChatMessageType::TradeCounter;
+        chatMsg.relatedTradeId = counterTrade.id;
+        chatMsg.timestamp = std::chrono::steady_clock::now();
+        
+        std::string proposerName = "Unknown";
+        if (originalTrade->fromPlayerId >= 0 && originalTrade->fromPlayerId < (int)ctx.game->players.size()) {
+            proposerName = ctx.game->players[originalTrade->fromPlayerId].name;
+        }
+        
+        std::ostringstream desc;
+        desc << "🔄 Counter-offer to " << proposerName << ": ";
+        if (!message.empty()) desc << message;
+        chatMsg.content = desc.str();
+        
+        counterTrade.chatMessageId = chatMsg.id;
+        ctx.game->tradeOffers.push_back(counterTrade);
+        ctx.game->chatMessages.push_back(chatMsg);
+        
+        catan::SSEEvent tradeEvent = catan::GameEvents::createTradeProposedEvent(
+            counterTrade.id, counterTrade.fromPlayerId, ctx.player->name, counterTrade.toPlayerId,
+            offering.wood, offering.brick, offering.wheat, offering.sheep, offering.ore,
+            requesting.wood, requesting.brick, requesting.wheat, requesting.sheep, requesting.ore,
+            message
+        );
+        catan::sseManager.broadcastToGame(gameId, tradeEvent);
+        
+        catan::SSEEvent chatEvent = catan::GameEvents::createChatMessageEvent(
+            chatMsg.id, chatMsg.fromPlayerId, ctx.player->name,
+            chatMsg.toPlayerId, chatMsg.content, "trade_counter"
+        );
+        catan::sseManager.broadcastToGame(gameId, chatEvent);
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"counter_trade\",\"counterTradeId\":" + std::to_string(counterTrade.id) + "}");
+    }
+    
     return jsonResponse(400, "{\"error\":\"Unknown tool: " + toolName + "\"}");
 }
 
@@ -1434,6 +2338,53 @@ std::string routeRequest(const HTTPRequest& req) {
         // POST /games/{id}/trade/bank - Trade with bank
         if (req.method == "POST" && gamePath.action == "trade/bank") {
             return handleBankTrade(req, gamePath.gameId);
+        }
+        
+        // ============ CHAT ENDPOINTS ============
+        
+        // POST /games/{id}/chat - Send a chat message
+        if (req.method == "POST" && gamePath.action == "chat") {
+            return handleSendChat(req, gamePath.gameId);
+        }
+        
+        // GET /games/{id}/chat - Get chat history
+        if (req.method == "GET" && gamePath.action == "chat") {
+            return handleGetChatHistory(req, gamePath.gameId);
+        }
+        
+        // ============ PLAYER TRADE ENDPOINTS ============
+        
+        // POST /games/{id}/trade/propose - Propose a trade
+        if (req.method == "POST" && gamePath.action == "trade/propose") {
+            return handleProposeTrade(req, gamePath.gameId);
+        }
+        
+        // GET /games/{id}/trades - Get active trades
+        if (req.method == "GET" && gamePath.action == "trades") {
+            return handleGetActiveTrades(req, gamePath.gameId);
+        }
+        
+        // Handle trade actions with trade ID: /games/{id}/trade/{tradeId}/{action}
+        if (gamePath.action.substr(0, 6) == "trade/" && gamePath.action.length() > 6) {
+            std::string rest = gamePath.action.substr(6);
+            size_t slashPos = rest.find('/');
+            if (slashPos != std::string::npos) {
+                int tradeId = std::stoi(rest.substr(0, slashPos));
+                std::string tradeAction = rest.substr(slashPos + 1);
+                
+                if (req.method == "POST" && tradeAction == "accept") {
+                    return handleAcceptTrade(req, gamePath.gameId, tradeId);
+                }
+                if (req.method == "POST" && tradeAction == "reject") {
+                    return handleRejectTrade(req, gamePath.gameId, tradeId);
+                }
+                if (req.method == "POST" && tradeAction == "counter") {
+                    return handleCounterTrade(req, gamePath.gameId, tradeId);
+                }
+                if (req.method == "POST" && tradeAction == "cancel") {
+                    return handleCancelTrade(req, gamePath.gameId, tradeId);
+                }
+            }
         }
         
         // POST /games/{id}/end-turn - End your turn

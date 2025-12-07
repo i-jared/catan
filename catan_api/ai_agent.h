@@ -94,6 +94,53 @@ struct EndTurnParams {
     // No parameters needed
 };
 
+struct SendChatParams {
+    int toPlayerId;         // -1 for public message
+    std::string message;
+};
+
+struct ProposeTradeParams {
+    int toPlayerId;         // -1 for open trade to all
+    // Resources to give
+    int giveWood;
+    int giveBrick;
+    int giveWheat;
+    int giveSheep;
+    int giveOre;
+    // Resources to receive
+    int wantWood;
+    int wantBrick;
+    int wantWheat;
+    int wantSheep;
+    int wantOre;
+    std::string message;    // Optional message with trade proposal
+};
+
+struct AcceptTradeParams {
+    int tradeId;
+};
+
+struct RejectTradeParams {
+    int tradeId;
+};
+
+struct CounterTradeParams {
+    int originalTradeId;
+    // Counter-offer resources to give
+    int giveWood;
+    int giveBrick;
+    int giveWheat;
+    int giveSheep;
+    int giveOre;
+    // Counter-offer resources to receive
+    int wantWood;
+    int wantBrick;
+    int wantWheat;
+    int wantSheep;
+    int wantOre;
+    std::string message;
+};
+
 // ============================================================================
 // TOOL RESULT
 // ============================================================================
@@ -176,6 +223,31 @@ struct AIGameState {
     
     // Available actions based on current phase and resources
     std::vector<std::string> availableTools;
+    
+    // Chat and trade info
+    struct ChatMessageInfo {
+        std::string id;
+        int fromPlayerId;
+        std::string fromPlayerName;
+        int toPlayerId;         // -1 for public
+        std::string content;
+        std::string type;       // "normal", "trade_proposal", "trade_accept", etc.
+        int relatedTradeId;
+    };
+    std::vector<ChatMessageInfo> recentChatMessages;
+    
+    struct TradeOfferInfo {
+        int tradeId;
+        int fromPlayerId;
+        std::string fromPlayerName;
+        int toPlayerId;         // -1 for open trade
+        int offeringWood, offeringBrick, offeringWheat, offeringSheep, offeringOre;
+        int requestingWood, requestingBrick, requestingWheat, requestingSheep, requestingOre;
+        bool isActive;
+        std::vector<int> acceptedBy;
+        std::vector<int> rejectedBy;
+    };
+    std::vector<TradeOfferInfo> activeTrades;
 };
 
 // Convert game state to AI-friendly view

@@ -175,3 +175,60 @@ export interface PendingAITurnsInfo {
   humanCount: number;
   aiCount: number;
 }
+
+// ============================================================================
+// CHAT AND TRADE TYPES
+// ============================================================================
+
+export type ChatMessageType = 'normal' | 'trade_proposal' | 'trade_accept' | 'trade_reject' | 'trade_counter' | 'system';
+
+export interface ChatMessage {
+  id: string;
+  fromPlayerId: number;
+  fromPlayerName: string;
+  toPlayerId: number;  // -1 for public
+  content: string;
+  type: ChatMessageType;
+  relatedTradeId?: number;
+}
+
+export interface TradeOffer {
+  id: number;
+  fromPlayerId: number;
+  fromPlayerName: string;
+  toPlayerId: number;  // -1 for open trade
+  offering: ResourceHand;
+  requesting: ResourceHand;
+  isActive: boolean;
+  acceptedBy?: number[];
+  rejectedBy?: number[];
+  message?: string;
+}
+
+export interface ChatHistoryResponse {
+  messages: ChatMessage[];
+}
+
+export interface ActiveTradesResponse {
+  trades: TradeOffer[];
+}
+
+export interface ProposeTradeRequest {
+  toPlayerId: number;
+  giveWood: number;
+  giveBrick: number;
+  giveWheat: number;
+  giveSheep: number;
+  giveOre: number;
+  wantWood: number;
+  wantBrick: number;
+  wantWheat: number;
+  wantSheep: number;
+  wantOre: number;
+  message?: string;
+}
+
+export interface SendChatRequest {
+  toPlayerId: number;
+  message: string;
+}

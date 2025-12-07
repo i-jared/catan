@@ -188,6 +188,130 @@ SSEEvent createGameStateChangedEvent(const std::string& gameStateJson) {
     return event;
 }
 
+SSEEvent createChatMessageEvent(
+    const std::string& messageId,
+    int fromPlayerId,
+    const std::string& fromPlayerName,
+    int toPlayerId,
+    const std::string& content,
+    const std::string& messageType
+) {
+    std::ostringstream json;
+    json << "{";
+    json << "\"messageId\":\"" << messageId << "\",";
+    json << "\"fromPlayerId\":" << fromPlayerId << ",";
+    json << "\"fromPlayerName\":\"" << fromPlayerName << "\",";
+    json << "\"toPlayerId\":" << toPlayerId << ",";
+    // Escape special characters in content
+    std::string escapedContent;
+    for (char c : content) {
+        if (c == '"') escapedContent += "\\\"";
+        else if (c == '\\') escapedContent += "\\\\";
+        else if (c == '\n') escapedContent += "\\n";
+        else if (c == '\r') escapedContent += "\\r";
+        else if (c == '\t') escapedContent += "\\t";
+        else escapedContent += c;
+    }
+    json << "\"content\":\"" << escapedContent << "\",";
+    json << "\"type\":\"" << messageType << "\"";
+    json << "}";
+    
+    SSEEvent event;
+    event.event = CHAT_MESSAGE;
+    event.data = json.str();
+    event.id = sseManager.nextEventId();
+    return event;
+}
+
+SSEEvent createTradeProposedEvent(
+    int tradeId,
+    int fromPlayerId,
+    const std::string& fromPlayerName,
+    int toPlayerId,
+    int offerWood, int offerBrick, int offerWheat, int offerSheep, int offerOre,
+    int requestWood, int requestBrick, int requestWheat, int requestSheep, int requestOre,
+    const std::string& message
+) {
+    std::ostringstream json;
+    json << "{";
+    json << "\"tradeId\":" << tradeId << ",";
+    json << "\"fromPlayerId\":" << fromPlayerId << ",";
+    json << "\"fromPlayerName\":\"" << fromPlayerName << "\",";
+    json << "\"toPlayerId\":" << toPlayerId << ",";
+    json << "\"offering\":{";
+    json << "\"wood\":" << offerWood << ",";
+    json << "\"brick\":" << offerBrick << ",";
+    json << "\"wheat\":" << offerWheat << ",";
+    json << "\"sheep\":" << offerSheep << ",";
+    json << "\"ore\":" << offerOre << "},";
+    json << "\"requesting\":{";
+    json << "\"wood\":" << requestWood << ",";
+    json << "\"brick\":" << requestBrick << ",";
+    json << "\"wheat\":" << requestWheat << ",";
+    json << "\"sheep\":" << requestSheep << ",";
+    json << "\"ore\":" << requestOre << "}";
+    if (!message.empty()) {
+        std::string escapedMessage;
+        for (char c : message) {
+            if (c == '"') escapedMessage += "\\\"";
+            else if (c == '\\') escapedMessage += "\\\\";
+            else if (c == '\n') escapedMessage += "\\n";
+            else escapedMessage += c;
+        }
+        json << ",\"message\":\"" << escapedMessage << "\"";
+    }
+    json << "}";
+    
+    SSEEvent event;
+    event.event = TRADE_PROPOSED;
+    event.data = json.str();
+    event.id = sseManager.nextEventId();
+    return event;
+}
+
+SSEEvent createTradeResponseEvent(
+    const std::string& eventType,
+    int tradeId,
+    int responderId,
+    const std::string& responderName
+) {
+    std::ostringstream json;
+    json << "{";
+    json << "\"tradeId\":" << tradeId << ",";
+    json << "\"responderId\":" << responderId << ",";
+    json << "\"responderName\":\"" << responderName << "\"";
+    json << "}";
+    
+    SSEEvent event;
+    event.event = eventType;
+    event.data = json.str();
+    event.id = sseManager.nextEventId();
+    return event;
+}
+
+SSEEvent createTradeExecutedEvent(
+    int tradeId,
+    int player1Id,
+    const std::string& player1Name,
+    int player2Id,
+    const std::string& player2Name
+) {
+    std::ostringstream json;
+    json << "{";
+    json << "\"tradeId\":" << tradeId << ",";
+    json << "\"player1Id\":" << player1Id << ",";
+    json << "\"player1Name\":\"" << player1Name << "\",";
+    json << "\"player2Id\":" << player2Id << ",";
+    json << "\"player2Name\":\"" << player2Name << "\"";
+    json << "}";
+    
+    SSEEvent event;
+    event.event = TRADE_EXECUTED;
+    event.data = json.str();
+    event.id = sseManager.nextEventId();
+    return event;
+}
+
 }  // namespace GameEvents
 
 }  // namespace catan

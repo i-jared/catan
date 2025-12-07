@@ -253,10 +253,42 @@ struct DiceRoll {
 };
 
 struct TradeOffer {
+    int id;                          // Unique trade ID
     int fromPlayerId;
+    int toPlayerId;                  // -1 for open trade to all players
     ResourceHand offering;
     ResourceHand requesting;
     std::vector<int> acceptedByPlayerIds;
+    std::vector<int> rejectedByPlayerIds;
+    bool isActive = true;
+    std::string chatMessageId;       // Associated chat message if proposed via chat
+};
+
+// ============================================================================
+// CHAT SYSTEM
+// ============================================================================
+
+enum class ChatMessageType {
+    Normal,         // Regular chat message
+    TradeProposal,  // Trade proposal (creates an official trade)
+    TradeAccept,    // Accepting a trade
+    TradeReject,    // Rejecting a trade
+    TradeCounter,   // Counter-offer
+    System          // System announcements
+};
+
+struct ChatMessage {
+    std::string id;                  // Unique message ID
+    int fromPlayerId;                // -1 for system messages
+    int toPlayerId;                  // -1 for public messages (to all)
+    std::string content;             // Message text
+    ChatMessageType type = ChatMessageType::Normal;
+    int relatedTradeId = -1;         // For trade-related messages
+    std::chrono::steady_clock::time_point timestamp;
+    
+    // For trade proposals embedded in chat
+    std::optional<ResourceHand> tradeOffering;
+    std::optional<ResourceHand> tradeRequesting;
 };
 
 // ============================================================================
@@ -286,7 +318,10 @@ struct Game {
     int currentPlayerIndex = 0;
     int setupRound = 0;             // 0 or 1 for setup phases
     std::optional<DiceRoll> lastRoll;
-    std::optional<TradeOffer> activeTradeOffer;
+    std::vector<TradeOffer> tradeOffers;           // All trade offers (active and completed)
+    std::vector<ChatMessage> chatMessages;         // All chat messages
+    int nextTradeId = 1;
+    int nextChatMessageId = 1;
     bool devCardPlayedThisTurn = false;
     
     // Achievements tracking

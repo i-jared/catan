@@ -572,3 +572,409 @@ button:disabled {
     gap: 0.5rem;
   }
 }
+
+/* ============================================================================
+   CHAT PANEL STYLES
+   ============================================================================ */
+
+.left-sidebar,
+.right-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.chat-panel {
+  background: var(--color-surface);
+  border-radius: 12px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-height: calc(100vh - 150px);
+}
+
+.chat-panel h3 {
+  margin: 0 0 1rem 0;
+  color: var(--color-text-muted);
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding-right: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.chat-message {
+  background: var(--color-surface-light);
+  border-radius: 8px;
+  padding: 0.75rem;
+  animation: fadeIn 0.3s ease;
+}
+
+.chat-message.own-message {
+  background: var(--color-secondary);
+  margin-left: 1rem;
+}
+
+.chat-message.private-message {
+  border-left: 3px solid var(--color-warning);
+}
+
+.chat-message.trade-message {
+  background: linear-gradient(135deg, var(--color-surface-light) 0%, var(--color-secondary) 100%);
+  border-left: 3px solid var(--color-ai);
+}
+
+.chat-message.trade-accept {
+  border-left: 3px solid var(--color-success);
+}
+
+.chat-message.trade-reject {
+  border-left: 3px solid var(--color-primary);
+}
+
+.chat-message.system-message {
+  background: var(--color-bg);
+  font-style: italic;
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.chat-sender {
+  font-weight: 600;
+  font-size: 0.875rem;
+  color: var(--color-human);
+}
+
+.chat-message.own-message .chat-sender {
+  color: var(--color-primary);
+}
+
+.chat-recipient {
+  font-size: 0.75rem;
+  color: var(--color-warning);
+}
+
+.chat-content {
+  font-size: 0.9rem;
+  line-height: 1.4;
+  word-wrap: break-word;
+}
+
+.chat-input-area {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--color-surface-light);
+}
+
+.chat-target {
+  padding: 0.5rem;
+  background: var(--color-bg);
+  color: var(--color-text);
+  border: 1px solid var(--color-surface-light);
+  border-radius: 4px;
+  font-size: 0.875rem;
+  min-width: 100px;
+}
+
+.chat-input {
+  flex: 1;
+  padding: 0.5rem 0.75rem;
+  background: var(--color-bg);
+  color: var(--color-text);
+  border: 1px solid var(--color-surface-light);
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.chat-input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.btn-send {
+  padding: 0.5rem 1rem;
+  background: var(--color-primary);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: background 0.2s;
+}
+
+.btn-send:hover:not(:disabled) {
+  background: var(--color-primary-hover);
+}
+
+.btn-send:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ============================================================================
+   TRADE PANEL STYLES
+   ============================================================================ */
+
+.trade-panel {
+  background: var(--color-surface);
+  border-radius: 12px;
+  padding: 1rem;
+}
+
+.trade-panel h3 {
+  margin: 0 0 1rem 0;
+  color: var(--color-text-muted);
+}
+
+.active-trades {
+  margin-bottom: 1rem;
+}
+
+.active-trades h4 {
+  margin: 0 0 0.75rem 0;
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+}
+
+.trade-offer {
+  background: var(--color-surface-light);
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin-bottom: 0.5rem;
+  border-left: 3px solid var(--color-ai);
+}
+
+.trade-offer.own-trade {
+  border-left-color: var(--color-human);
+}
+
+.trade-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.875rem;
+}
+
+.trade-from {
+  font-weight: 600;
+  color: var(--color-human);
+}
+
+.trade-arrow {
+  color: var(--color-text-muted);
+}
+
+.trade-to {
+  color: var(--color-text-muted);
+}
+
+.trade-details {
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+
+.trade-offering,
+.trade-requesting {
+  margin: 0.25rem 0;
+}
+
+.trade-offering strong,
+.trade-requesting strong {
+  color: var(--color-text-muted);
+  margin-right: 0.5rem;
+}
+
+.trade-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.btn-accept {
+  flex: 1;
+  padding: 0.4rem 0.75rem;
+  background: var(--color-success);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.btn-accept:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-reject {
+  flex: 1;
+  padding: 0.4rem 0.75rem;
+  background: var(--color-primary);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.btn-cancel {
+  flex: 1;
+  padding: 0.4rem 0.75rem;
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-text-muted);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.btn-propose {
+  width: 100%;
+  padding: 0.75rem;
+  background: var(--color-secondary);
+  color: var(--color-text);
+  border: 2px dashed var(--color-text-muted);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: all 0.2s;
+}
+
+.btn-propose:hover {
+  border-color: var(--color-primary);
+  background: var(--color-surface-light);
+}
+
+.propose-trade-form {
+  background: var(--color-surface-light);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.propose-trade-form h4 {
+  margin: 0 0 1rem 0;
+  color: var(--color-text);
+}
+
+.trade-target {
+  margin-bottom: 1rem;
+}
+
+.trade-target label {
+  display: block;
+  margin-bottom: 0.5rem;
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+}
+
+.trade-target select {
+  width: 100%;
+  padding: 0.5rem;
+  background: var(--color-bg);
+  color: var(--color-text);
+  border: 1px solid var(--color-surface);
+  border-radius: 4px;
+}
+
+.trade-resources {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.offering-section h5,
+.requesting-section h5 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+}
+
+.resource-input {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+  padding: 0.25rem;
+  background: var(--color-bg);
+  border-radius: 4px;
+}
+
+.resource-input .emoji {
+  font-size: 1rem;
+}
+
+.resource-input input {
+  width: 50px;
+  padding: 0.25rem;
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-surface-light);
+  border-radius: 4px;
+  text-align: center;
+}
+
+.resource-input .label {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.trade-message {
+  margin-bottom: 1rem;
+}
+
+.trade-message input {
+  width: 100%;
+  padding: 0.5rem;
+  background: var(--color-bg);
+  color: var(--color-text);
+  border: 1px solid var(--color-surface);
+  border-radius: 4px;
+}
+
+.trade-form-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.trade-form-actions button {
+  flex: 1;
+}
+
+/* ============================================================================
+   CONNECTION STATUS
+   ============================================================================ */
+
+.connection-status {
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.connection-status.connected {
+  background: rgba(76, 175, 80, 0.2);
+  color: var(--color-success);
+}
+
+.connection-status.disconnected {
+  background: rgba(233, 69, 96, 0.2);
+  color: var(--color-primary);
+}
