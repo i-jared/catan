@@ -7,6 +7,9 @@ import type {
   RollDiceResponse,
   AIToolDefinition,
   PendingAITurnsInfo,
+  ChatHistoryResponse,
+  ActiveTradesResponse,
+  ProposeTradeRequest,
 } from './types';
 
 const API_BASE = 'http://localhost:8080';
@@ -206,6 +209,53 @@ class CatanAPI {
 
   async getAITools(): Promise<{ tools: AIToolDefinition[] }> {
     return this.request('GET', '/ai/tools', undefined, false);
+  }
+
+  // ============================================================================
+  // CHAT ENDPOINTS
+  // ============================================================================
+
+  async sendChat(gameId: string, toPlayerId: number, message: string): Promise<{ success: boolean; messageId: string }> {
+    return this.request('POST', `/games/${gameId}/chat`, { toPlayerId, message });
+  }
+
+  async getChatHistory(gameId: string): Promise<ChatHistoryResponse> {
+    return this.request('GET', `/games/${gameId}/chat`);
+  }
+
+  // ============================================================================
+  // PLAYER TRADE ENDPOINTS
+  // ============================================================================
+
+  async proposeTrade(
+    gameId: string,
+    trade: ProposeTradeRequest
+  ): Promise<{ success: boolean; tradeId: number; messageId: string }> {
+    return this.request('POST', `/games/${gameId}/trade/propose`, trade);
+  }
+
+  async getActiveTrades(gameId: string): Promise<ActiveTradesResponse> {
+    return this.request('GET', `/games/${gameId}/trades`);
+  }
+
+  async acceptTrade(gameId: string, tradeId: number): Promise<{ success: boolean; executed: boolean }> {
+    return this.request('POST', `/games/${gameId}/trade/${tradeId}/accept`);
+  }
+
+  async rejectTrade(gameId: string, tradeId: number): Promise<{ success: boolean }> {
+    return this.request('POST', `/games/${gameId}/trade/${tradeId}/reject`);
+  }
+
+  async counterTrade(
+    gameId: string,
+    originalTradeId: number,
+    counter: Omit<ProposeTradeRequest, 'toPlayerId'>
+  ): Promise<{ success: boolean; counterTradeId: number }> {
+    return this.request('POST', `/games/${gameId}/trade/${originalTradeId}/counter`, counter);
+  }
+
+  async cancelTrade(gameId: string, tradeId: number): Promise<{ success: boolean }> {
+    return this.request('POST', `/games/${gameId}/trade/${tradeId}/cancel`);
   }
 }
 

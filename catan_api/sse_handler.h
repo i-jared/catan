@@ -125,6 +125,15 @@ namespace GameEvents {
     constexpr const char* GAME_STARTED = "game_started";
     constexpr const char* GAME_ENDED = "game_ended";
     
+    // Chat and trade events
+    constexpr const char* CHAT_MESSAGE = "chat_message";
+    constexpr const char* TRADE_PROPOSED = "trade_proposed";
+    constexpr const char* TRADE_ACCEPTED = "trade_accepted";
+    constexpr const char* TRADE_REJECTED = "trade_rejected";
+    constexpr const char* TRADE_COUNTERED = "trade_countered";
+    constexpr const char* TRADE_EXECUTED = "trade_executed";
+    constexpr const char* TRADE_CANCELLED = "trade_cancelled";
+    
     // Helper to create AI action event
     SSEEvent createAIActionEvent(
         int playerId,
@@ -143,6 +152,44 @@ namespace GameEvents {
     
     // Helper to create game state changed event
     SSEEvent createGameStateChangedEvent(const std::string& gameStateJson);
+    
+    // Helper to create chat message event
+    SSEEvent createChatMessageEvent(
+        const std::string& messageId,
+        int fromPlayerId,
+        const std::string& fromPlayerName,
+        int toPlayerId,
+        const std::string& content,
+        const std::string& messageType
+    );
+    
+    // Helper to create trade proposed event
+    SSEEvent createTradeProposedEvent(
+        int tradeId,
+        int fromPlayerId,
+        const std::string& fromPlayerName,
+        int toPlayerId,
+        int offerWood, int offerBrick, int offerWheat, int offerSheep, int offerOre,
+        int requestWood, int requestBrick, int requestWheat, int requestSheep, int requestOre,
+        const std::string& message
+    );
+    
+    // Helper to create trade response event
+    SSEEvent createTradeResponseEvent(
+        const std::string& eventType,  // TRADE_ACCEPTED, TRADE_REJECTED, etc.
+        int tradeId,
+        int responderId,
+        const std::string& responderName
+    );
+    
+    // Helper to create trade executed event
+    SSEEvent createTradeExecutedEvent(
+        int tradeId,
+        int player1Id,
+        const std::string& player1Name,
+        int player2Id,
+        const std::string& player2Name
+    );
 }
 
 // Global SSE manager instance
