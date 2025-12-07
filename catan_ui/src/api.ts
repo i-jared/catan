@@ -134,16 +134,34 @@ class CatanAPI {
     return this.request('POST', `/games/${gameId}/roll`);
   }
 
-  async buyRoad(gameId: string): Promise<{ success: boolean; roadsRemaining: number }> {
-    return this.request('POST', `/games/${gameId}/buy/road`);
+  async buyRoad(gameId: string, hexQ: number, hexR: number, direction: number): Promise<{ success: boolean; roadsRemaining: number }> {
+    return this.request('POST', `/games/${gameId}/buy/road`, { hexQ, hexR, direction });
   }
 
-  async buySettlement(gameId: string): Promise<{ success: boolean; settlementsRemaining: number }> {
-    return this.request('POST', `/games/${gameId}/buy/settlement`);
+  async buySettlement(gameId: string, hexQ: number, hexR: number, direction: number): Promise<{ success: boolean; settlementsRemaining: number }> {
+    return this.request('POST', `/games/${gameId}/buy/settlement`, { hexQ, hexR, direction });
   }
 
-  async buyCity(gameId: string): Promise<{ success: boolean; citiesRemaining: number }> {
-    return this.request('POST', `/games/${gameId}/buy/city`);
+  async buyCity(gameId: string, hexQ: number, hexR: number, direction: number): Promise<{ success: boolean; citiesRemaining: number }> {
+    return this.request('POST', `/games/${gameId}/buy/city`, { hexQ, hexR, direction });
+  }
+
+  // ============================================================================
+  // SETUP PHASE ENDPOINTS
+  // ============================================================================
+
+  async setupPlaceSettlement(gameId: string, hexQ: number, hexR: number, direction: number): Promise<{ success: boolean; needsRoad: boolean }> {
+    return this.request('POST', `/games/${gameId}/setup/settlement`, { hexQ, hexR, direction });
+  }
+
+  async setupPlaceRoad(gameId: string, hexQ: number, hexR: number, direction: number): Promise<{ 
+    success: boolean; 
+    setupComplete: boolean; 
+    phase: string;
+    currentPlayer: number;
+    currentPlayerIsAI?: boolean;
+  }> {
+    return this.request('POST', `/games/${gameId}/setup/road`, { hexQ, hexR, direction });
   }
 
   async buyDevCard(gameId: string): Promise<{ success: boolean; card: string; cardsInDeck: number }> {
@@ -154,7 +172,7 @@ class CatanAPI {
     gameId: string,
     give: string,
     receive: string
-  ): Promise<{ success: boolean; traded: object }> {
+  ): Promise<{ success: boolean; traded: { gave: string; gaveAmount: number; received: string; receivedAmount: number } }> {
     return this.request('POST', `/games/${gameId}/trade/bank`, { give, receive });
   }
 

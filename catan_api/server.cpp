@@ -19,6 +19,7 @@
 #include "ai_agent.h"
 #include "llm_provider.h"
 #include "sse_handler.h"
+#include "game_logic.h"
 
 // Global LLM config manager
 catan::ai::LLMConfigManager llmConfigManager;
@@ -320,6 +321,46 @@ std::string handleAddAIPlayers(const HTTPRequest& req, const std::string& gameId
     return jsonResponse(200, json.str());
 }
 
+std::string phaseToString(catan::GamePhase phase) {
+    switch (phase) {
+        case catan::GamePhase::WaitingForPlayers: return "waiting_for_players";
+        case catan::GamePhase::Setup: return "setup";
+        case catan::GamePhase::SetupReverse: return "setup_reverse";
+        case catan::GamePhase::Rolling: return "rolling";
+        case catan::GamePhase::Robber: return "robber";
+        case catan::GamePhase::Stealing: return "stealing";
+        case catan::GamePhase::MainTurn: return "main_turn";
+        case catan::GamePhase::Trading: return "trading";
+        case catan::GamePhase::Finished: return "finished";
+        default: return "unknown";
+    }
+}
+
+std::string hexTypeToString(catan::HexType type) {
+    switch (type) {
+        case catan::HexType::Desert: return "desert";
+        case catan::HexType::Forest: return "forest";
+        case catan::HexType::Hills: return "hills";
+        case catan::HexType::Fields: return "fields";
+        case catan::HexType::Pasture: return "pasture";
+        case catan::HexType::Mountains: return "mountains";
+        case catan::HexType::Ocean: return "ocean";
+        default: return "unknown";
+    }
+}
+
+std::string portTypeToString(catan::PortType type) {
+    switch (type) {
+        case catan::PortType::Generic: return "generic";
+        case catan::PortType::Wood: return "wood";
+        case catan::PortType::Brick: return "brick";
+        case catan::PortType::Wheat: return "wheat";
+        case catan::PortType::Sheep: return "sheep";
+        case catan::PortType::Ore: return "ore";
+        default: return "generic";
+    }
+}
+
 std::string handleGetGameState(const HTTPRequest& req, const std::string& gameId) {
     // Validate session
     catan::Session* session = sessionManager.getSession(req.authToken);
@@ -334,14 +375,15 @@ std::string handleGetGameState(const HTTPRequest& req, const std::string& gameId
     
     std::lock_guard<std::mutex> lock(game->mutex);
     
-    // Build game state JSON (simplified - would use a JSON library in production)
+    // Build comprehensive game state JSON
     std::ostringstream json;
     json << "{"
          << "\"gameId\":\"" << game->gameId << "\","
-         << "\"phase\":" << static_cast<int>(game->phase) << ","
+         << "\"phase\":\"" << phaseToString(game->phase) << "\","
          << "\"currentPlayer\":" << game->currentPlayerIndex << ","
          << "\"playerCount\":" << game->players.size() << ","
-         << "\"yourPlayerId\":" << session->playerId;
+         << "\"yourPlayerId\":" << session->playerId << ","
+         << "\"setupRound\":" << game->setupRound;
     
     // Include this player's resources
     if (session->playerId < (int)game->players.size()) {
@@ -353,6 +395,180 @@ std::string handleGetGameState(const HTTPRequest& req, const std::string& gameId
              << "\"sheep\":" << player.resources.sheep << ","
              << "\"ore\":" << player.resources.ore
              << "}";
+        
+        // Include dev cards
+        json << ",\"devCards\":[";
+        for (size_t i = 0; i < player.devCards.size(); i++) {
+            if (i > 0) json << ",";
+            switch (player.devCards[i]) {
+                case catan::DevCardType::Knight: json << "\"knight\""; break;
+                case catan::DevCardType::VictoryPoint: json << "\"victory_point\""; break;
+                case catan::DevCardType::RoadBuilding: json << "\"road_building\""; break;
+                case catan::DevCardType::YearOfPlenty: json << "\"year_of_plenty\""; break;
+                case catan::DevCardType::Monopoly: json << "\"monopoly\""; break;
+            }
+        }
+        json << "]";
+        
+        // Include building counts
+        json << ",\"settlementsRemaining\":" << player.settlementsRemaining;
+        json << ",\"citiesRemaining\":" << player.citiesRemaining;
+        json << ",\"roadsRemaining\":" << player.roadsRemaining;
+    }
+    
+    // Include last roll if any
+    if (game->lastRoll) {
+        json << ",\"lastRoll\":{\"die1\":" << game->lastRoll->die1 
+             << ",\"die2\":" << game->lastRoll->die2 
+             << ",\"total\":" << game->lastRoll->total() << "}";
+    }
+    
+    // Include all players info
+    json << ",\"players\":[";
+    for (size_t i = 0; i < game->players.size(); i++) {
+        auto& p = game->players[i];
+        if (i > 0) json << ",";
+        json << "{\"id\":" << p.id
+             << ",\"name\":\"" << p.name << "\""
+             << ",\"type\":\"" << (p.playerType == catan::PlayerType::AI ? "ai" : "human") << "\""
+             << ",\"resourceCount\":" << p.resources.total()
+             << ",\"devCardCount\":" << p.devCards.size()
+             << ",\"knightsPlayed\":" << p.knightsPlayed
+             << ",\"hasLongestRoad\":" << (p.hasLongestRoad ? "true" : "false")
+             << ",\"hasLargestArmy\":" << (p.hasLargestArmy ? "true" : "false")
+             << ",\"victoryPoints\":" << catan::calculateVisibleVictoryPoints(*game, p.id)
+             << ",\"settlementsRemaining\":" << p.settlementsRemaining
+             << ",\"citiesRemaining\":" << p.citiesRemaining
+             << ",\"roadsRemaining\":" << p.roadsRemaining
+             << "}";
+    }
+    json << "]";
+    
+    // Include board hexes
+    json << ",\"hexes\":[";
+    bool firstHex = true;
+    for (const auto& [coord, hex] : game->board.hexes) {
+        if (!firstHex) json << ",";
+        firstHex = false;
+        json << "{\"q\":" << coord.q << ",\"r\":" << coord.r
+             << ",\"type\":\"" << hexTypeToString(hex.type) << "\""
+             << ",\"numberToken\":" << hex.numberToken
+             << ",\"hasRobber\":" << (hex.hasRobber ? "true" : "false")
+             << "}";
+    }
+    json << "]";
+    
+    // Include vertices with buildings
+    json << ",\"vertices\":[";
+    bool firstVertex = true;
+    for (const auto& [coord, vertex] : game->board.vertices) {
+        if (vertex.building != catan::Building::None) {
+            if (!firstVertex) json << ",";
+            firstVertex = false;
+            json << "{\"hexQ\":" << coord.hex.q << ",\"hexR\":" << coord.hex.r
+                 << ",\"direction\":" << coord.direction
+                 << ",\"building\":\"" << (vertex.building == catan::Building::Settlement ? "settlement" : "city") << "\""
+                 << ",\"playerId\":" << vertex.ownerPlayerId
+                 << "}";
+        }
+    }
+    json << "]";
+    
+    // Include edges with roads
+    json << ",\"edges\":[";
+    bool firstEdge = true;
+    for (const auto& [coord, edge] : game->board.edges) {
+        if (edge.hasRoad) {
+            if (!firstEdge) json << ",";
+            firstEdge = false;
+            json << "{\"hexQ\":" << coord.hex.q << ",\"hexR\":" << coord.hex.r
+                 << ",\"direction\":" << coord.direction
+                 << ",\"playerId\":" << edge.ownerPlayerId
+                 << "}";
+        }
+    }
+    json << "]";
+    
+    // Include ports
+    json << ",\"ports\":[";
+    for (size_t i = 0; i < game->board.ports.size(); i++) {
+        auto& port = game->board.ports[i];
+        if (i > 0) json << ",";
+        json << "{\"type\":\"" << portTypeToString(port.type) << "\""
+             << ",\"v1q\":" << port.vertex1.hex.q << ",\"v1r\":" << port.vertex1.hex.r
+             << ",\"v1d\":" << port.vertex1.direction
+             << ",\"v2q\":" << port.vertex2.hex.q << ",\"v2r\":" << port.vertex2.hex.r
+             << ",\"v2d\":" << port.vertex2.direction
+             << "}";
+    }
+    json << "]";
+    
+    // Include robber location
+    json << ",\"robberLocation\":{\"q\":" << game->board.robberLocation.q 
+         << ",\"r\":" << game->board.robberLocation.r << "}";
+    
+    // Include winner if game is finished
+    int winner = catan::checkForWinner(*game);
+    if (winner >= 0) {
+        json << ",\"winner\":" << winner;
+    }
+    
+    // Include valid build locations if it's this player's turn
+    if (game->currentPlayerIndex == session->playerId) {
+        if (game->phase == catan::GamePhase::Setup || game->phase == catan::GamePhase::SetupReverse) {
+            // Setup phase - valid settlement locations
+            auto validSettlements = catan::getValidSetupSettlementLocations(*game);
+            json << ",\"validSettlementLocations\":[";
+            for (size_t i = 0; i < validSettlements.size(); i++) {
+                if (i > 0) json << ",";
+                json << "{\"hexQ\":" << validSettlements[i].hex.q
+                     << ",\"hexR\":" << validSettlements[i].hex.r
+                     << ",\"direction\":" << validSettlements[i].direction << "}";
+            }
+            json << "]";
+        } else if (game->phase == catan::GamePhase::MainTurn) {
+            // Main turn - valid build locations
+            auto& player = game->players[session->playerId];
+            
+            // Valid settlement locations
+            if (canAfford(player.resources, SETTLEMENT_COST) && player.settlementsRemaining > 0) {
+                auto validSettlements = catan::getValidSettlementLocations(*game, session->playerId);
+                json << ",\"validSettlementLocations\":[";
+                for (size_t i = 0; i < validSettlements.size(); i++) {
+                    if (i > 0) json << ",";
+                    json << "{\"hexQ\":" << validSettlements[i].hex.q
+                         << ",\"hexR\":" << validSettlements[i].hex.r
+                         << ",\"direction\":" << validSettlements[i].direction << "}";
+                }
+                json << "]";
+            }
+            
+            // Valid road locations
+            if (canAfford(player.resources, ROAD_COST) && player.roadsRemaining > 0) {
+                auto validRoads = catan::getValidRoadLocations(*game, session->playerId);
+                json << ",\"validRoadLocations\":[";
+                for (size_t i = 0; i < validRoads.size(); i++) {
+                    if (i > 0) json << ",";
+                    json << "{\"hexQ\":" << validRoads[i].hex.q
+                         << ",\"hexR\":" << validRoads[i].hex.r
+                         << ",\"direction\":" << validRoads[i].direction << "}";
+                }
+                json << "]";
+            }
+            
+            // Valid city locations
+            if (canAfford(player.resources, CITY_COST) && player.citiesRemaining > 0) {
+                auto validCities = catan::getValidCityLocations(*game, session->playerId);
+                json << ",\"validCityLocations\":[";
+                for (size_t i = 0; i < validCities.size(); i++) {
+                    if (i > 0) json << ",";
+                    json << "{\"hexQ\":" << validCities[i].hex.q
+                         << ",\"hexR\":" << validCities[i].hex.r
+                         << ",\"direction\":" << validCities[i].direction << "}";
+                }
+                json << "]";
+            }
+        }
     }
     
     json << "}";
@@ -513,14 +729,53 @@ std::string handleBuyRoad(const HTTPRequest& req, const std::string& gameId) {
         return jsonResponse(400, "{\"error\":\"No roads remaining\"}");
     }
     
-    // TODO: Parse edge location from request body and validate placement
-    // For now, just deduct resources
+    // Parse location from request body
+    int hexQ = parseJsonInt(req.body, "hexQ", 0);
+    int hexR = parseJsonInt(req.body, "hexR", 0);
+    int direction = parseJsonInt(req.body, "direction", 0);
+    
+    catan::EdgeCoord location{{hexQ, hexR}, direction};
+    
+    // Validate road placement
+    auto validLocations = catan::getValidRoadLocations(*ctx.game, ctx.session->playerId);
+    bool isValid = false;
+    for (const auto& loc : validLocations) {
+        if (loc.hex.q == hexQ && loc.hex.r == hexR && loc.direction == direction) {
+            isValid = true;
+            break;
+        }
+    }
+    
+    if (!isValid) {
+        return jsonResponse(400, "{\"error\":\"Invalid road location. Must connect to your network.\"}");
+    }
+    
+    // Place the road
+    auto it = ctx.game->board.edges.find(location);
+    if (it == ctx.game->board.edges.end()) {
+        return jsonResponse(400, "{\"error\":\"Invalid edge location\"}");
+    }
+    
+    it->second.hasRoad = true;
+    it->second.ownerPlayerId = ctx.session->playerId;
     subtractResources(ctx.player->resources, ROAD_COST);
     ctx.player->roadsRemaining--;
     
+    // Update longest road
+    catan::updateLongestRoad(*ctx.game);
+    
+    // Check for winner
+    int winner = catan::checkForWinner(*ctx.game);
+    if (winner >= 0) {
+        ctx.game->phase = catan::GamePhase::Finished;
+    }
+    
     return jsonResponse(200, 
-        "{\"success\":true,\"message\":\"Road purchased\","
-        "\"roadsRemaining\":" + std::to_string(ctx.player->roadsRemaining) + "}");
+        "{\"success\":true,\"message\":\"Road built\","
+        "\"roadsRemaining\":" + std::to_string(ctx.player->roadsRemaining) + ","
+        "\"hexQ\":" + std::to_string(hexQ) + ","
+        "\"hexR\":" + std::to_string(hexR) + ","
+        "\"direction\":" + std::to_string(direction) + "}");
 }
 
 std::string handleBuySettlement(const HTTPRequest& req, const std::string& gameId) {
@@ -541,14 +796,50 @@ std::string handleBuySettlement(const HTTPRequest& req, const std::string& gameI
         return jsonResponse(400, "{\"error\":\"No settlements remaining\"}");
     }
     
-    // TODO: Parse vertex location from request body and validate placement
-    // For now, just deduct resources
+    // Parse location from request body
+    int hexQ = parseJsonInt(req.body, "hexQ", 0);
+    int hexR = parseJsonInt(req.body, "hexR", 0);
+    int direction = parseJsonInt(req.body, "direction", 0);
+    
+    catan::VertexCoord location{{hexQ, hexR}, direction};
+    
+    // Validate settlement placement
+    auto validLocations = catan::getValidSettlementLocations(*ctx.game, ctx.session->playerId);
+    bool isValid = false;
+    for (const auto& loc : validLocations) {
+        if (loc.hex.q == hexQ && loc.hex.r == hexR && loc.direction == direction) {
+            isValid = true;
+            break;
+        }
+    }
+    
+    if (!isValid) {
+        return jsonResponse(400, "{\"error\":\"Invalid settlement location. Must be on your road network and 2+ edges from other buildings.\"}");
+    }
+    
+    // Place the settlement
+    auto it = ctx.game->board.vertices.find(location);
+    if (it == ctx.game->board.vertices.end()) {
+        return jsonResponse(400, "{\"error\":\"Invalid vertex location\"}");
+    }
+    
+    it->second.building = catan::Building::Settlement;
+    it->second.ownerPlayerId = ctx.session->playerId;
     subtractResources(ctx.player->resources, SETTLEMENT_COST);
     ctx.player->settlementsRemaining--;
     
+    // Check for winner
+    int winner = catan::checkForWinner(*ctx.game);
+    if (winner >= 0) {
+        ctx.game->phase = catan::GamePhase::Finished;
+    }
+    
     return jsonResponse(200, 
-        "{\"success\":true,\"message\":\"Settlement purchased\","
-        "\"settlementsRemaining\":" + std::to_string(ctx.player->settlementsRemaining) + "}");
+        "{\"success\":true,\"message\":\"Settlement built\","
+        "\"settlementsRemaining\":" + std::to_string(ctx.player->settlementsRemaining) + ","
+        "\"hexQ\":" + std::to_string(hexQ) + ","
+        "\"hexR\":" + std::to_string(hexR) + ","
+        "\"direction\":" + std::to_string(direction) + "}");
 }
 
 std::string handleBuyCity(const HTTPRequest& req, const std::string& gameId) {
@@ -569,16 +860,50 @@ std::string handleBuyCity(const HTTPRequest& req, const std::string& gameId) {
         return jsonResponse(400, "{\"error\":\"No cities remaining\"}");
     }
     
-    // Must upgrade an existing settlement (returns settlement to pool)
-    // TODO: Parse vertex location and verify there's a settlement there
+    // Parse location from request body
+    int hexQ = parseJsonInt(req.body, "hexQ", 0);
+    int hexR = parseJsonInt(req.body, "hexR", 0);
+    int direction = parseJsonInt(req.body, "direction", 0);
     
+    catan::VertexCoord location{{hexQ, hexR}, direction};
+    
+    // Validate city placement - must have your settlement there
+    auto validLocations = catan::getValidCityLocations(*ctx.game, ctx.session->playerId);
+    bool isValid = false;
+    for (const auto& loc : validLocations) {
+        if (loc.hex.q == hexQ && loc.hex.r == hexR && loc.direction == direction) {
+            isValid = true;
+            break;
+        }
+    }
+    
+    if (!isValid) {
+        return jsonResponse(400, "{\"error\":\"Invalid city location. Must upgrade your own settlement.\"}");
+    }
+    
+    // Upgrade to city
+    auto it = ctx.game->board.vertices.find(location);
+    if (it == ctx.game->board.vertices.end()) {
+        return jsonResponse(400, "{\"error\":\"Invalid vertex location\"}");
+    }
+    
+    it->second.building = catan::Building::City;
     subtractResources(ctx.player->resources, CITY_COST);
     ctx.player->citiesRemaining--;
     ctx.player->settlementsRemaining++; // Get settlement back
     
+    // Check for winner
+    int winner = catan::checkForWinner(*ctx.game);
+    if (winner >= 0) {
+        ctx.game->phase = catan::GamePhase::Finished;
+    }
+    
     return jsonResponse(200, 
-        "{\"success\":true,\"message\":\"City purchased\","
-        "\"citiesRemaining\":" + std::to_string(ctx.player->citiesRemaining) + "}");
+        "{\"success\":true,\"message\":\"City built\","
+        "\"citiesRemaining\":" + std::to_string(ctx.player->citiesRemaining) + ","
+        "\"hexQ\":" + std::to_string(hexQ) + ","
+        "\"hexR\":" + std::to_string(hexR) + ","
+        "\"direction\":" + std::to_string(direction) + "}");
 }
 
 std::string handleBuyDevCard(const HTTPRequest& req, const std::string& gameId) {
@@ -646,9 +971,8 @@ std::string handleBankTrade(const HTTPRequest& req, const std::string& gameId) {
         return jsonResponse(400, "{\"error\":\"Cannot trade same resource\"}");
     }
     
-    // Determine trade ratio (4:1 default, could be 3:1 or 2:1 with ports)
-    // TODO: Check if player has access to ports
-    int ratio = 4;
+    // Determine trade ratio based on ports (2:1 specific, 3:1 generic, 4:1 default)
+    int ratio = catan::getTradeRatio(*ctx.game, ctx.session->playerId, give);
     
     if (ctx.player->resources[give] < ratio) {
         return jsonResponse(400, 
@@ -1291,24 +1615,19 @@ std::string handleStartGame(const HTTPRequest& req, const std::string& gameId) {
         return jsonResponse(400, "{\"error\":\"Need at least 2 players to start\"}");
     }
     
-    // Skip setup phase for now, go straight to rolling
-    // TODO: Implement proper setup phase for initial placements
-    ctx.game->phase = catan::GamePhase::Rolling;
+    // Start with setup phase - each player places 2 settlements and 2 roads
+    ctx.game->phase = catan::GamePhase::Setup;
     ctx.game->currentPlayerIndex = 0;
-    
-    // Give starting resources (shortcut - normally earned from 2nd settlement)
-    for (auto& player : ctx.game->players) {
-        player.resources = {2, 2, 2, 2, 2}; // 2 of each to start
-    }
+    ctx.game->setupRound = 0;
     
     // Check if the first player is AI
     catan::ai::AIPlayerManager aiManager(ctx.game);
     bool firstIsAI = aiManager.isCurrentPlayerAI();
     
     std::ostringstream json;
-    json << "{\"success\":true,\"message\":\"Game started\"";
+    json << "{\"success\":true,\"message\":\"Game started - setup phase\"";
     json << ",\"currentPlayer\":0";
-    json << ",\"phase\":\"rolling\"";
+    json << ",\"phase\":\"setup\"";
     json << ",\"currentPlayerIsAI\":" << (firstIsAI ? "true" : "false");
     
     // Include player info
@@ -1321,6 +1640,142 @@ std::string handleStartGame(const HTTPRequest& req, const std::string& gameId) {
         json << ",\"type\":\"" << (p.isAI() ? "ai" : "human") << "\"}";
     }
     json << "]";
+    json << "}";
+    
+    return jsonResponse(200, json.str());
+}
+
+// Handle setup phase settlement placement
+std::string handleSetupPlaceSettlement(const HTTPRequest& req, const std::string& gameId) {
+    GameContext ctx = getGameContext(req, gameId);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    if (ctx.game->phase != catan::GamePhase::Setup && ctx.game->phase != catan::GamePhase::SetupReverse) {
+        return jsonResponse(400, "{\"error\":\"Not in setup phase\"}");
+    }
+    
+    // Parse location
+    int hexQ = parseJsonInt(req.body, "hexQ", 0);
+    int hexR = parseJsonInt(req.body, "hexR", 0);
+    int direction = parseJsonInt(req.body, "direction", 0);
+    
+    catan::VertexCoord location{{hexQ, hexR}, direction};
+    
+    // Validate location
+    auto validLocations = catan::getValidSetupSettlementLocations(*ctx.game);
+    bool isValid = false;
+    for (const auto& loc : validLocations) {
+        if (loc.hex.q == hexQ && loc.hex.r == hexR && loc.direction == direction) {
+            isValid = true;
+            break;
+        }
+    }
+    
+    if (!isValid) {
+        return jsonResponse(400, "{\"error\":\"Invalid settlement location for setup\"}");
+    }
+    
+    // Place settlement
+    if (!catan::placeSetupSettlement(*ctx.game, ctx.session->playerId, location)) {
+        return jsonResponse(400, "{\"error\":\"Failed to place settlement\"}");
+    }
+    
+    // If this is the second settlement (setup_reverse), give initial resources
+    if (ctx.game->phase == catan::GamePhase::SetupReverse) {
+        catan::giveInitialResources(*ctx.game, ctx.session->playerId, location);
+    }
+    
+    // Store the settlement location for road placement
+    ctx.game->lastActivity = std::chrono::steady_clock::now();
+    
+    return jsonResponse(200, 
+        "{\"success\":true,\"message\":\"Settlement placed - now place a road\","
+        "\"hexQ\":" + std::to_string(hexQ) + ","
+        "\"hexR\":" + std::to_string(hexR) + ","
+        "\"direction\":" + std::to_string(direction) + ","
+        "\"needsRoad\":true}");
+}
+
+// Handle setup phase road placement
+std::string handleSetupPlaceRoad(const HTTPRequest& req, const std::string& gameId) {
+    GameContext ctx = getGameContext(req, gameId);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    if (ctx.game->phase != catan::GamePhase::Setup && ctx.game->phase != catan::GamePhase::SetupReverse) {
+        return jsonResponse(400, "{\"error\":\"Not in setup phase\"}");
+    }
+    
+    // Parse location
+    int hexQ = parseJsonInt(req.body, "hexQ", 0);
+    int hexR = parseJsonInt(req.body, "hexR", 0);
+    int direction = parseJsonInt(req.body, "direction", 0);
+    
+    catan::EdgeCoord location{{hexQ, hexR}, direction};
+    
+    // Find player's most recently placed settlement (for validation)
+    // In setup, the road must connect to the settlement just placed
+    catan::VertexCoord lastSettlement{{0, 0}, 0};
+    bool foundSettlement = false;
+    
+    // Find the last settlement placed by this player
+    for (const auto& [coord, vertex] : ctx.game->board.vertices) {
+        if (vertex.ownerPlayerId == ctx.session->playerId && vertex.building == catan::Building::Settlement) {
+            // Check if road could connect to this settlement
+            auto validRoads = catan::getValidSetupRoadLocations(*ctx.game, coord);
+            for (const auto& vr : validRoads) {
+                if (vr.hex.q == hexQ && vr.hex.r == hexR && vr.direction == direction) {
+                    lastSettlement = coord;
+                    foundSettlement = true;
+                    break;
+                }
+            }
+            if (foundSettlement) break;
+        }
+    }
+    
+    if (!foundSettlement) {
+        return jsonResponse(400, "{\"error\":\"Road must connect to your settlement\"}");
+    }
+    
+    // Validate road location
+    auto validLocations = catan::getValidSetupRoadLocations(*ctx.game, lastSettlement);
+    bool isValid = false;
+    for (const auto& loc : validLocations) {
+        if (loc.hex.q == hexQ && loc.hex.r == hexR && loc.direction == direction) {
+            isValid = true;
+            break;
+        }
+    }
+    
+    if (!isValid) {
+        return jsonResponse(400, "{\"error\":\"Invalid road location for setup\"}");
+    }
+    
+    // Place road
+    if (!catan::placeSetupRoad(*ctx.game, ctx.session->playerId, location)) {
+        return jsonResponse(400, "{\"error\":\"Failed to place road\"}");
+    }
+    
+    // Advance to next player/phase
+    catan::advanceSetupPhase(*ctx.game);
+    
+    bool setupComplete = (ctx.game->phase == catan::GamePhase::Rolling);
+    catan::Player* nextPlayer = ctx.game->getCurrentPlayer();
+    
+    std::ostringstream json;
+    json << "{\"success\":true";
+    json << ",\"message\":\"" << (setupComplete ? "Setup complete! Game starting." : "Road placed") << "\"";
+    json << ",\"setupComplete\":" << (setupComplete ? "true" : "false");
+    json << ",\"phase\":\"" << phaseToString(ctx.game->phase) << "\"";
+    json << ",\"currentPlayer\":" << ctx.game->currentPlayerIndex;
+    if (nextPlayer) {
+        json << ",\"currentPlayerName\":\"" << nextPlayer->name << "\"";
+        json << ",\"currentPlayerIsAI\":" << (nextPlayer->isAI() ? "true" : "false");
+    }
     json << "}";
     
     return jsonResponse(200, json.str());
@@ -2308,6 +2763,18 @@ std::string routeRequest(const HTTPRequest& req) {
         // POST /games/{id}/start - Start the game
         if (req.method == "POST" && gamePath.action == "start") {
             return handleStartGame(req, gamePath.gameId);
+        }
+        
+        // ============ SETUP PHASE ENDPOINTS ============
+        
+        // POST /games/{id}/setup/settlement - Place settlement during setup
+        if (req.method == "POST" && gamePath.action == "setup/settlement") {
+            return handleSetupPlaceSettlement(req, gamePath.gameId);
+        }
+        
+        // POST /games/{id}/setup/road - Place road during setup
+        if (req.method == "POST" && gamePath.action == "setup/road") {
+            return handleSetupPlaceRoad(req, gamePath.gameId);
         }
         
         // POST /games/{id}/roll - Roll dice

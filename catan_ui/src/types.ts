@@ -8,6 +8,7 @@ export type Building = 'none' | 'settlement' | 'city';
 export type DevCardType = 'knight' | 'victory_point' | 'road_building' | 'year_of_plenty' | 'monopoly';
 export type GamePhase = 'waiting_for_players' | 'setup' | 'setup_reverse' | 'rolling' | 'robber' | 'stealing' | 'main_turn' | 'trading' | 'finished';
 export type PlayerType = 'human' | 'ai';
+export type PortType = 'generic' | 'wood' | 'brick' | 'wheat' | 'sheep' | 'ore';
 
 export interface ResourceHand {
   wood: number;
@@ -27,7 +28,10 @@ export interface Player {
   knightsPlayed: number;
   hasLongestRoad: boolean;
   hasLargestArmy: boolean;
-  visibleVictoryPoints: number;
+  victoryPoints: number;
+  settlementsRemaining: number;
+  citiesRemaining: number;
+  roadsRemaining: number;
 }
 
 export interface HexInfo {
@@ -43,14 +47,36 @@ export interface VertexInfo {
   hexR: number;
   direction: number;
   building: Building;
-  ownerPlayerId: number;
+  playerId: number;
 }
 
 export interface EdgeInfo {
   hexQ: number;
   hexR: number;
   direction: number;
-  ownerPlayerId: number;
+  playerId: number;
+}
+
+export interface PortInfo {
+  type: PortType;
+  v1q: number;
+  v1r: number;
+  v1d: number;
+  v2q: number;
+  v2r: number;
+  v2d: number;
+}
+
+export interface BoardLocation {
+  hexQ: number;
+  hexR: number;
+  direction: number;
+}
+
+export interface LastRoll {
+  die1: number;
+  die2: number;
+  total: number;
 }
 
 export interface GameState {
@@ -59,8 +85,23 @@ export interface GameState {
   currentPlayer: number;
   playerCount: number;
   yourPlayerId: number;
+  setupRound?: number;
   resources?: ResourceHand;
+  devCards?: DevCardType[];
+  settlementsRemaining?: number;
+  citiesRemaining?: number;
+  roadsRemaining?: number;
+  lastRoll?: LastRoll;
   players?: Player[];
+  hexes?: HexInfo[];
+  vertices?: VertexInfo[];
+  edges?: EdgeInfo[];
+  ports?: PortInfo[];
+  robberLocation?: { q: number; r: number };
+  winner?: number;
+  validSettlementLocations?: BoardLocation[];
+  validRoadLocations?: BoardLocation[];
+  validCityLocations?: BoardLocation[];
 }
 
 // ============================================================================

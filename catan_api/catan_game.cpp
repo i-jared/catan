@@ -187,15 +187,41 @@ GameBoard generateRandomBoard() {
     }
     
     // Setup ports (9 ports in standard game)
-    // Port positions are on the outer edge - simplified version
+    // Port positions are on the outer edge of the hexagon board
     std::vector<PortType> portTypes = {
         PortType::Generic, PortType::Generic, PortType::Generic, PortType::Generic,
         PortType::Wood, PortType::Brick, PortType::Wheat, PortType::Sheep, PortType::Ore
     };
     std::shuffle(portTypes.begin(), portTypes.end(), gen);
     
-    // Port positions (simplified - would need proper edge vertices in full impl)
-    // For now we just store the port types; proper placement needs more geometry
+    // Define port positions on the outer ring (vertices that touch only 1-2 land hexes)
+    // These are the coastal vertices around the board
+    std::vector<std::pair<VertexCoord, VertexCoord>> portPositions = {
+        // Top edge ports
+        {{{0, -2}, 0}, {{0, -2}, 1}},
+        {{{1, -2}, 1}, {{1, -2}, 2}},
+        // Right edge ports  
+        {{{2, -1}, 2}, {{2, -1}, 3}},
+        {{{2, 0}, 3}, {{2, 0}, 4}},
+        // Bottom right ports
+        {{{1, 1}, 4}, {{1, 1}, 5}},
+        // Bottom edge ports
+        {{{-1, 2}, 4}, {{-1, 2}, 5}},
+        // Left edge ports
+        {{{-2, 2}, 5}, {{-2, 2}, 0}},
+        {{{-2, 1}, 0}, {{-2, 1}, 1}},
+        // Top left port
+        {{{-1, -1}, 0}, {{-1, -1}, 1}},
+    };
+    
+    // Assign port types to positions
+    for (size_t i = 0; i < portTypes.size() && i < portPositions.size(); i++) {
+        Port port;
+        port.vertex1 = portPositions[i].first;
+        port.vertex2 = portPositions[i].second;
+        port.type = portTypes[i];
+        board.ports.push_back(port);
+    }
     
     return board;
 }
