@@ -7,6 +7,7 @@
 #include <optional>
 #include <mutex>
 #include <chrono>
+#include <memory>
 
 namespace catan {
 
@@ -54,6 +55,15 @@ enum class PortType {
     Wheat,      // 2:1 wheat
     Sheep,      // 2:1 sheep
     Ore         // 2:1 ore
+};
+
+// ============================================================================
+// PLAYER TYPE - Distinguishes human players from AI agents
+// ============================================================================
+
+enum class PlayerType {
+    Human,      // Controlled by a real person
+    AI          // Controlled by an LLM agent
 };
 
 // ============================================================================
@@ -184,6 +194,7 @@ struct Player {
     int id;
     std::string name;
     std::string sessionToken;       // for reconnection
+    PlayerType playerType = PlayerType::Human;  // Human or AI
     
     ResourceHand resources;
     std::vector<DevCardType> devCards;
@@ -211,6 +222,9 @@ struct Player {
         }
         return vp;
     }
+    
+    bool isHuman() const { return playerType == PlayerType::Human; }
+    bool isAI() const { return playerType == PlayerType::AI; }
     
     bool isConnected = false;
     std::chrono::steady_clock::time_point lastActivity;
@@ -313,7 +327,7 @@ struct Game {
 
 class GameManager {
 private:
-    std::unordered_map<std::string, Game> games;
+    std::unordered_map<std::string, std::unique_ptr<Game>> games;
     mutable std::mutex mutex;
     
 public:

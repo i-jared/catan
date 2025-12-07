@@ -27,17 +27,17 @@ std::string GameManager::createGame(const std::string& name, int maxPlayers) {
     
     std::string gameId = generateGameId();
     
-    Game game;
-    game.gameId = gameId;
-    game.name = name;
-    game.maxPlayers = maxPlayers;
-    game.phase = GamePhase::WaitingForPlayers;
-    game.board = generateRandomBoard();
-    game.createdAt = std::chrono::steady_clock::now();
-    game.lastActivity = game.createdAt;
+    auto game = std::make_unique<Game>();
+    game->gameId = gameId;
+    game->name = name;
+    game->maxPlayers = maxPlayers;
+    game->phase = GamePhase::WaitingForPlayers;
+    game->board = generateRandomBoard();
+    game->createdAt = std::chrono::steady_clock::now();
+    game->lastActivity = game->createdAt;
     
     // Initialize dev card deck (25 cards total in base game)
-    game.devCardDeck = {
+    game->devCardDeck = {
         // 14 Knights
         DevCardType::Knight, DevCardType::Knight, DevCardType::Knight,
         DevCardType::Knight, DevCardType::Knight, DevCardType::Knight,
@@ -59,7 +59,7 @@ std::string GameManager::createGame(const std::string& name, int maxPlayers) {
     // Shuffle the deck
     std::random_device rd;
     std::mt19937 g(rd());
-    std::shuffle(game.devCardDeck.begin(), game.devCardDeck.end(), g);
+    std::shuffle(game->devCardDeck.begin(), game->devCardDeck.end(), g);
     
     games[gameId] = std::move(game);
     return gameId;
@@ -69,7 +69,7 @@ Game* GameManager::getGame(const std::string& gameId) {
     std::lock_guard<std::mutex> lock(mutex);
     auto it = games.find(gameId);
     if (it != games.end()) {
-        return &it->second;
+        return it->second.get();
     }
     return nullptr;
 }
@@ -78,7 +78,7 @@ std::vector<std::string> GameManager::listGames() {
     std::lock_guard<std::mutex> lock(mutex);
     std::vector<std::string> result;
     for (const auto& pair : games) {
-        if (!pair.second.isPrivate) {
+        if (!pair.second->isPrivate) {
             result.push_back(pair.first);
         }
     }
