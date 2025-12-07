@@ -1,73 +1,122 @@
-# React + TypeScript + Vite
+# Catan with AI Agents
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A Catan board game implementation with support for human players and LLM-powered AI agents.
 
-Currently, two official plugins are available:
+## Features
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- **Human + AI Gameplay**: Play against LLM agents that use tools to make decisions
+- **Flexible Player Configuration**: Currently supports 1 human + 3 AI, but designed to easily extend to multiple humans
+- **Automatic AI Turns**: When a human ends their turn, AI players automatically take their turns in sequence
+- **Tool-based AI System**: AI agents interact with the game through a defined set of tools (roll dice, build, trade, etc.)
 
-## React Compiler
+## Architecture
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### Backend (C++)
 
-## Expanding the ESLint configuration
+The server provides a REST API for game management:
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+```
+LOBBY:
+  POST /games              - Create a new game
+  GET  /games              - List all games
+  POST /games/{id}/join    - Join a game (body: {name, isAI})
+  POST /games/{id}/add-ai  - Add AI players to fill slots
+  POST /games/{id}/start   - Start the game
+  GET  /games/{id}         - Get game state
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+GAMEPLAY:
+  POST /games/{id}/roll           - Roll dice
+  POST /games/{id}/buy/road       - Buy a road
+  POST /games/{id}/buy/settlement - Buy a settlement
+  POST /games/{id}/buy/city       - Buy a city
+  POST /games/{id}/buy/devcard    - Buy dev card
+  POST /games/{id}/trade/bank     - Trade with bank (4:1)
+  POST /games/{id}/end-turn       - End your turn
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+AI AGENT ENDPOINTS:
+  GET  /ai/tools                 - Get AI tool definitions (JSON schema)
+  GET  /games/{id}/ai/state      - Get game state formatted for AI decision making
+  POST /games/{id}/ai/execute    - Execute an AI tool
+  GET  /games/{id}/ai/pending    - Get pending AI turn info
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### Frontend (React + TypeScript)
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+The UI handles:
+- Game lobby (create/join game, add AI players)
+- Game board display with resources and actions
+- AI turn processing (calls LLM for decisions, executes tools)
+- Action log showing all game events
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+### AI Agent System
+
+AI players use a tool-based system similar to function calling:
+
+**Available Tools:**
+- `roll_dice` - Roll dice to start turn
+- `build_road` - Build a road (1 wood + 1 brick)
+- `build_settlement` - Build a settlement (1 each wood/brick/wheat/sheep)
+- `build_city` - Upgrade to city (2 wheat + 3 ore)
+- `buy_dev_card` - Buy development card (1 each wheat/sheep/ore)
+- `bank_trade` - Trade 4:1 with bank
+- `move_robber` - Move robber after rolling 7
+- `play_knight` - Play Knight card
+- `play_road_building` - Play Road Building card
+- `play_year_of_plenty` - Play Year of Plenty card
+- `play_monopoly` - Play Monopoly card
+- `end_turn` - End current turn
+
+## Getting Started
+
+### Build Backend
+
+```bash
+cd catan_api
+g++ -std=c++17 -c -o catan_game.o catan_game.cpp
+g++ -std=c++17 -c -o ai_agent.o ai_agent.cpp
+g++ -std=c++17 -c -o server.o server.cpp
+g++ -std=c++17 -o catan_server server.o catan_game.o ai_agent.o -lpthread
+./catan_server
+```
+
+### Build Frontend
+
+```bash
+cd catan_ui
+npm install
+npm run dev  # Development
+npm run build  # Production
+```
+
+## Extending for Multiple Humans
+
+The system is designed for easy extension to multiple human players:
+
+1. **Player Type Tracking**: Each player has a `PlayerType` (Human/AI)
+2. **Session Tokens**: Each player (human or AI) has their own auth token
+3. **Turn Detection**: The `AIPlayerManager` identifies which players are AI vs human
+4. **UI State**: The frontend tracks which players are human to show appropriate UI
+
+To add multiple human support:
+1. Allow multiple users to join the same game
+2. Each human gets their own session token
+3. Show turn notifications to all connected humans
+4. AI turn processing happens after ANY human ends their turn (not just a specific one)
+
+## LLM Integration
+
+The current implementation uses a mock LLM (`aiAgent.ts`). To integrate a real LLM:
+
+1. Implement the `getAIDecision()` method in `AIAgentProcessor`
+2. Send the `AIGameState` to your LLM with the tool definitions
+3. Parse the LLM's tool call response
+4. Execute the tool via the API
+
+Supported LLM providers can be configured via `LLMConfig`:
+```typescript
+{
+  provider: 'anthropic' | 'openai' | 'mock',
+  apiKey: string,
+  model: string
+}
 ```

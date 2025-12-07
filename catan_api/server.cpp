@@ -10,9 +10,13 @@
 #include <sstream>
 #include <algorithm>
 #include <random>
+#include <queue>
+#include <condition_variable>
+#include <functional>
 
 #include "catan_types.h"
 #include "session.h"
+#include "ai_agent.h"
 
 // Global managers (in production, wrap these properly)
 catan::GameManager gameManager;
@@ -52,6 +56,37 @@ std::string parseJsonString(const std::string& json, const std::string& key) {
     size_t endPos = json.find("\"", pos);
     if (endPos == std::string::npos) return "";
     return json.substr(pos, endPos - pos);
+}
+
+int parseJsonInt(const std::string& json, const std::string& key, int defaultValue = 0) {
+    std::string searchKey = "\"" + key + "\":";
+    size_t pos = json.find(searchKey);
+    if (pos == std::string::npos) return defaultValue;
+    pos += searchKey.length();
+    // Skip whitespace
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    // Parse integer
+    size_t endPos = pos;
+    if (json[endPos] == '-') endPos++;
+    while (endPos < json.size() && std::isdigit(json[endPos])) endPos++;
+    if (endPos == pos) return defaultValue;
+    try {
+        return std::stoi(json.substr(pos, endPos - pos));
+    } catch (...) {
+        return defaultValue;
+    }
+}
+
+bool parseJsonBool(const std::string& json, const std::string& key, bool defaultValue = false) {
+    std::string searchKey = "\"" + key + "\":";
+    size_t pos = json.find(searchKey);
+    if (pos == std::string::npos) return defaultValue;
+    pos += searchKey.length();
+    // Skip whitespace
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (json.substr(pos, 4) == "true") return true;
+    if (json.substr(pos, 5) == "false") return false;
+    return defaultValue;
 }
 
 catan::Resource stringToResource(const std::string& name) {
@@ -182,23 +217,95 @@ std::string handleJoinGame(const HTTPRequest& req, const std::string& gameId) {
         return jsonResponse(400, "{\"error\":\"Game is full\"}");
     }
     
-    // Create the player
-    // TODO: Parse playerName from JSON body
+    // Parse player info from JSON body
+    std::string playerName = parseJsonString(req.body, "name");
+    bool isAI = parseJsonBool(req.body, "isAI", false);
+    
     int playerId = game->players.size();
     catan::Player player;
     player.id = playerId;
-    player.name = "Player " + std::to_string(playerId + 1);
+    player.name = playerName.empty() ? ("Player " + std::to_string(playerId + 1)) : playerName;
+    player.playerType = isAI ? catan::PlayerType::AI : catan::PlayerType::Human;
     player.isConnected = true;
     player.lastActivity = std::chrono::steady_clock::now();
     game->players.push_back(player);
     
-    // Create session token
+    // Create session token (even AI players get tokens for API access)
     std::string token = sessionManager.createSession(gameId, playerId, player.name);
+    
+    std::string playerTypeStr = isAI ? "ai" : "human";
     
     return jsonResponse(200, 
         "{\"token\":\"" + token + "\","
         "\"playerId\":" + std::to_string(playerId) + ","
-        "\"playerName\":\"" + player.name + "\"}");
+        "\"playerName\":\"" + player.name + "\","
+        "\"playerType\":\"" + playerTypeStr + "\"}");
+}
+
+// Add AI players to fill the game
+std::string handleAddAIPlayers(const HTTPRequest& req, const std::string& gameId) {
+    catan::Game* game = gameManager.getGame(gameId);
+    if (!game) {
+        return jsonResponse(404, "{\"error\":\"Game not found\"}");
+    }
+    
+    std::lock_guard<std::mutex> lock(game->mutex);
+    
+    if (game->phase != catan::GamePhase::WaitingForPlayers) {
+        return jsonResponse(400, "{\"error\":\"Game already started\"}");
+    }
+    
+    // Parse count from body, default to filling remaining slots
+    int requestedCount = parseJsonInt(req.body, "count", -1);
+    int availableSlots = game->maxPlayers - game->players.size();
+    
+    if (requestedCount < 0) {
+        requestedCount = availableSlots;
+    }
+    
+    int addCount = std::min(requestedCount, availableSlots);
+    
+    if (addCount <= 0) {
+        return jsonResponse(400, "{\"error\":\"No slots available for AI players\"}");
+    }
+    
+    // AI player names
+    static const std::vector<std::string> AI_NAMES = {
+        "Claude", "GPT", "Gemini", "LLaMA", "Mistral", "Falcon", "Cohere"
+    };
+    
+    std::vector<int> addedIds;
+    
+    for (int i = 0; i < addCount; i++) {
+        int playerId = game->players.size();
+        catan::Player aiPlayer;
+        aiPlayer.id = playerId;
+        
+        // Pick a name from the list, cycling through if needed
+        size_t nameIndex = playerId % AI_NAMES.size();
+        aiPlayer.name = AI_NAMES[nameIndex] + " (AI)";
+        
+        aiPlayer.playerType = catan::PlayerType::AI;
+        aiPlayer.isConnected = true;
+        aiPlayer.lastActivity = std::chrono::steady_clock::now();
+        game->players.push_back(aiPlayer);
+        
+        // Create session token for the AI player
+        sessionManager.createSession(gameId, playerId, aiPlayer.name);
+        
+        addedIds.push_back(playerId);
+    }
+    
+    // Build response
+    std::ostringstream json;
+    json << "{\"success\":true,\"addedCount\":" << addCount << ",\"addedPlayerIds\":[";
+    for (size_t i = 0; i < addedIds.size(); i++) {
+        if (i > 0) json << ",";
+        json << addedIds[i];
+    }
+    json << "],\"totalPlayers\":" << game->players.size() << "}";
+    
+    return jsonResponse(200, json.str());
 }
 
 std::string handleGetGameState(const HTTPRequest& req, const std::string& gameId) {
@@ -562,10 +669,29 @@ std::string handleEndTurn(const HTTPRequest& req, const std::string& gameId) {
     
     catan::Player* nextPlayer = ctx.game->getCurrentPlayer();
     
-    return jsonResponse(200, 
-        "{\"success\":true,"
-        "\"nextPlayer\":" + std::to_string(ctx.game->currentPlayerIndex) + ","
-        "\"nextPlayerName\":\"" + (nextPlayer ? nextPlayer->name : "unknown") + "\"}");
+    // Check if the next player is AI
+    catan::ai::AIPlayerManager aiManager(ctx.game);
+    bool nextIsAI = aiManager.isCurrentPlayerAI();
+    int nextHumanIndex = aiManager.getNextHumanPlayerIndex();
+    
+    std::ostringstream json;
+    json << "{\"success\":true";
+    json << ",\"nextPlayer\":" << ctx.game->currentPlayerIndex;
+    json << ",\"nextPlayerName\":\"" << (nextPlayer ? nextPlayer->name : "unknown") << "\"";
+    json << ",\"nextPlayerIsAI\":" << (nextIsAI ? "true" : "false");
+    
+    // If next player is AI, include info about when control returns to a human
+    if (nextIsAI) {
+        json << ",\"pendingAITurns\":true";
+        if (nextHumanIndex >= 0) {
+            json << ",\"nextHumanPlayerIndex\":" << nextHumanIndex;
+            json << ",\"nextHumanPlayerName\":\"" << ctx.game->players[nextHumanIndex].name << "\"";
+        }
+    }
+    
+    json << "}";
+    
+    return jsonResponse(200, json.str());
 }
 
 std::string handleStartGame(const HTTPRequest& req, const std::string& gameId) {
@@ -592,10 +718,402 @@ std::string handleStartGame(const HTTPRequest& req, const std::string& gameId) {
         player.resources = {2, 2, 2, 2, 2}; // 2 of each to start
     }
     
-    return jsonResponse(200, 
-        "{\"success\":true,\"message\":\"Game started\","
-        "\"currentPlayer\":0,"
-        "\"phase\":\"rolling\"}");
+    // Check if the first player is AI
+    catan::ai::AIPlayerManager aiManager(ctx.game);
+    bool firstIsAI = aiManager.isCurrentPlayerAI();
+    
+    std::ostringstream json;
+    json << "{\"success\":true,\"message\":\"Game started\"";
+    json << ",\"currentPlayer\":0";
+    json << ",\"phase\":\"rolling\"";
+    json << ",\"currentPlayerIsAI\":" << (firstIsAI ? "true" : "false");
+    
+    // Include player info
+    json << ",\"players\":[";
+    for (size_t i = 0; i < ctx.game->players.size(); i++) {
+        if (i > 0) json << ",";
+        auto& p = ctx.game->players[i];
+        json << "{\"id\":" << p.id;
+        json << ",\"name\":\"" << p.name << "\"";
+        json << ",\"type\":\"" << (p.isAI() ? "ai" : "human") << "\"}";
+    }
+    json << "]";
+    json << "}";
+    
+    return jsonResponse(200, json.str());
+}
+
+// ============================================================================
+// AI-SPECIFIC ENDPOINTS
+// ============================================================================
+
+// Get AI game state for decision making
+std::string handleGetAIState(const HTTPRequest& req, const std::string& gameId) {
+    GameContext ctx = getGameContext(req, gameId, false);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    catan::ai::AIGameState state = catan::ai::getAIGameState(*ctx.game, ctx.session->playerId);
+    std::string stateJson = catan::ai::aiGameStateToJson(state);
+    
+    return jsonResponse(200, stateJson);
+}
+
+// Get available tools and their definitions
+std::string handleGetAITools(const HTTPRequest& req) {
+    auto tools = catan::ai::getToolDefinitions();
+    
+    std::ostringstream json;
+    json << "{\"tools\":[";
+    for (size_t i = 0; i < tools.size(); i++) {
+        if (i > 0) json << ",";
+        json << "{\"name\":\"" << tools[i].name << "\"";
+        json << ",\"description\":\"" << tools[i].description << "\"";
+        json << ",\"parameters\":" << tools[i].parametersSchema;
+        json << "}";
+    }
+    json << "]}";
+    
+    return jsonResponse(200, json.str());
+}
+
+// Execute an AI tool
+std::string handleExecuteAITool(const HTTPRequest& req, const std::string& gameId) {
+    GameContext ctx = getGameContext(req, gameId);
+    if (ctx.errorCode) return jsonResponse(ctx.errorCode, ctx.error);
+    
+    // Verify this is an AI player
+    if (!ctx.player->isAI()) {
+        return jsonResponse(400, "{\"error\":\"This endpoint is for AI players only\"}");
+    }
+    
+    std::string toolName = parseJsonString(req.body, "tool");
+    if (toolName.empty()) {
+        return jsonResponse(400, "{\"error\":\"Missing 'tool' parameter\"}");
+    }
+    
+    std::lock_guard<std::mutex> lock(ctx.game->mutex);
+    
+    // Route to appropriate action handler based on tool name
+    // This reuses existing game logic
+    
+    if (toolName == "roll_dice") {
+        // Simulate the roll dice action
+        if (ctx.game->phase != catan::GamePhase::Rolling) {
+            return jsonResponse(400, "{\"error\":\"Cannot roll now\"}");
+        }
+        
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_int_distribution<> die(1, 6);
+        
+        catan::DiceRoll roll;
+        roll.die1 = die(gen);
+        roll.die2 = die(gen);
+        ctx.game->lastRoll = roll;
+        
+        int total = roll.total();
+        
+        if (total == 7) {
+            ctx.game->phase = catan::GamePhase::Robber;
+            return jsonResponse(200, 
+                "{\"success\":true,\"tool\":\"roll_dice\","
+                "\"die1\":" + std::to_string(roll.die1) + 
+                ",\"die2\":" + std::to_string(roll.die2) + 
+                ",\"total\":7,\"robber\":true}");
+        }
+        
+        // Resource distribution logic...
+        ctx.game->phase = catan::GamePhase::MainTurn;
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"roll_dice\","
+            "\"die1\":" + std::to_string(roll.die1) + 
+            ",\"die2\":" + std::to_string(roll.die2) + 
+            ",\"total\":" + std::to_string(total) + "}");
+    }
+    
+    if (toolName == "end_turn") {
+        if (ctx.game->phase != catan::GamePhase::MainTurn) {
+            return jsonResponse(400, "{\"error\":\"Cannot end turn during this phase\"}");
+        }
+        
+        ctx.game->currentPlayerIndex = (ctx.game->currentPlayerIndex + 1) % ctx.game->players.size();
+        ctx.game->phase = catan::GamePhase::Rolling;
+        ctx.game->devCardPlayedThisTurn = false;
+        
+        catan::Player* nextPlayer = ctx.game->getCurrentPlayer();
+        bool nextIsAI = nextPlayer && nextPlayer->isAI();
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"end_turn\","
+            "\"nextPlayer\":" + std::to_string(ctx.game->currentPlayerIndex) + 
+            ",\"nextPlayerIsAI\":" + (nextIsAI ? "true" : "false") + "}");
+    }
+    
+    if (toolName == "build_road") {
+        if (ctx.game->phase != catan::GamePhase::MainTurn) {
+            return jsonResponse(400, "{\"error\":\"Cannot build during this phase\"}");
+        }
+        if (!canAfford(ctx.player->resources, ROAD_COST)) {
+            return jsonResponse(400, "{\"error\":\"Not enough resources\"}");
+        }
+        if (ctx.player->roadsRemaining <= 0) {
+            return jsonResponse(400, "{\"error\":\"No roads remaining\"}");
+        }
+        
+        // Parse location
+        int hexQ = parseJsonInt(req.body, "hexQ", 0);
+        int hexR = parseJsonInt(req.body, "hexR", 0);
+        int direction = parseJsonInt(req.body, "direction", 0);
+        
+        // TODO: Validate placement rules
+        
+        subtractResources(ctx.player->resources, ROAD_COST);
+        ctx.player->roadsRemaining--;
+        
+        // Place the road on the board
+        catan::EdgeCoord coord{{hexQ, hexR}, direction};
+        auto it = ctx.game->board.edges.find(coord);
+        if (it != ctx.game->board.edges.end()) {
+            it->second.hasRoad = true;
+            it->second.ownerPlayerId = ctx.player->id;
+        }
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"build_road\","
+            "\"hexQ\":" + std::to_string(hexQ) +
+            ",\"hexR\":" + std::to_string(hexR) +
+            ",\"direction\":" + std::to_string(direction) + "}");
+    }
+    
+    if (toolName == "build_settlement") {
+        if (ctx.game->phase != catan::GamePhase::MainTurn) {
+            return jsonResponse(400, "{\"error\":\"Cannot build during this phase\"}");
+        }
+        if (!canAfford(ctx.player->resources, SETTLEMENT_COST)) {
+            return jsonResponse(400, "{\"error\":\"Not enough resources\"}");
+        }
+        if (ctx.player->settlementsRemaining <= 0) {
+            return jsonResponse(400, "{\"error\":\"No settlements remaining\"}");
+        }
+        
+        int hexQ = parseJsonInt(req.body, "hexQ", 0);
+        int hexR = parseJsonInt(req.body, "hexR", 0);
+        int direction = parseJsonInt(req.body, "direction", 0);
+        
+        // TODO: Validate placement rules
+        
+        subtractResources(ctx.player->resources, SETTLEMENT_COST);
+        ctx.player->settlementsRemaining--;
+        
+        catan::VertexCoord coord{{hexQ, hexR}, direction};
+        auto it = ctx.game->board.vertices.find(coord);
+        if (it != ctx.game->board.vertices.end()) {
+            it->second.building = catan::Building::Settlement;
+            it->second.ownerPlayerId = ctx.player->id;
+        }
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"build_settlement\","
+            "\"hexQ\":" + std::to_string(hexQ) +
+            ",\"hexR\":" + std::to_string(hexR) +
+            ",\"direction\":" + std::to_string(direction) + "}");
+    }
+    
+    if (toolName == "build_city") {
+        if (ctx.game->phase != catan::GamePhase::MainTurn) {
+            return jsonResponse(400, "{\"error\":\"Cannot build during this phase\"}");
+        }
+        if (!canAfford(ctx.player->resources, CITY_COST)) {
+            return jsonResponse(400, "{\"error\":\"Not enough resources\"}");
+        }
+        if (ctx.player->citiesRemaining <= 0) {
+            return jsonResponse(400, "{\"error\":\"No cities remaining\"}");
+        }
+        
+        int hexQ = parseJsonInt(req.body, "hexQ", 0);
+        int hexR = parseJsonInt(req.body, "hexR", 0);
+        int direction = parseJsonInt(req.body, "direction", 0);
+        
+        // Verify there's a settlement to upgrade
+        catan::VertexCoord coord{{hexQ, hexR}, direction};
+        auto it = ctx.game->board.vertices.find(coord);
+        if (it == ctx.game->board.vertices.end() || 
+            it->second.building != catan::Building::Settlement ||
+            it->second.ownerPlayerId != ctx.player->id) {
+            return jsonResponse(400, "{\"error\":\"No settlement to upgrade at this location\"}");
+        }
+        
+        subtractResources(ctx.player->resources, CITY_COST);
+        ctx.player->citiesRemaining--;
+        ctx.player->settlementsRemaining++;  // Return settlement
+        it->second.building = catan::Building::City;
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"build_city\","
+            "\"hexQ\":" + std::to_string(hexQ) +
+            ",\"hexR\":" + std::to_string(hexR) +
+            ",\"direction\":" + std::to_string(direction) + "}");
+    }
+    
+    if (toolName == "buy_dev_card") {
+        if (ctx.game->phase != catan::GamePhase::MainTurn) {
+            return jsonResponse(400, "{\"error\":\"Cannot buy during this phase\"}");
+        }
+        if (!canAfford(ctx.player->resources, DEV_CARD_COST)) {
+            return jsonResponse(400, "{\"error\":\"Not enough resources\"}");
+        }
+        if (ctx.game->devCardDeck.empty()) {
+            return jsonResponse(400, "{\"error\":\"No dev cards remaining\"}");
+        }
+        
+        subtractResources(ctx.player->resources, DEV_CARD_COST);
+        
+        catan::DevCardType card = ctx.game->devCardDeck.back();
+        ctx.game->devCardDeck.pop_back();
+        ctx.player->devCards.push_back(card);
+        
+        std::string cardName;
+        switch (card) {
+            case catan::DevCardType::Knight: cardName = "knight"; break;
+            case catan::DevCardType::VictoryPoint: cardName = "victory_point"; break;
+            case catan::DevCardType::RoadBuilding: cardName = "road_building"; break;
+            case catan::DevCardType::YearOfPlenty: cardName = "year_of_plenty"; break;
+            case catan::DevCardType::Monopoly: cardName = "monopoly"; break;
+        }
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"buy_dev_card\",\"card\":\"" + cardName + "\"}");
+    }
+    
+    if (toolName == "bank_trade") {
+        if (ctx.game->phase != catan::GamePhase::MainTurn) {
+            return jsonResponse(400, "{\"error\":\"Cannot trade during this phase\"}");
+        }
+        
+        std::string giveStr = parseJsonString(req.body, "give");
+        std::string receiveStr = parseJsonString(req.body, "receive");
+        
+        catan::Resource give = stringToResource(giveStr);
+        catan::Resource receive = stringToResource(receiveStr);
+        
+        if (give == catan::Resource::None || receive == catan::Resource::None) {
+            return jsonResponse(400, "{\"error\":\"Invalid resources\"}");
+        }
+        
+        int ratio = 4;  // TODO: Check for ports
+        
+        if (ctx.player->resources[give] < ratio) {
+            return jsonResponse(400, "{\"error\":\"Not enough resources\"}");
+        }
+        
+        ctx.player->resources[give] -= ratio;
+        ctx.player->resources[receive] += 1;
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"bank_trade\","
+            "\"gave\":\"" + giveStr + "\",\"gaveAmount\":" + std::to_string(ratio) +
+            ",\"received\":\"" + receiveStr + "\",\"receivedAmount\":1}");
+    }
+    
+    if (toolName == "move_robber") {
+        if (ctx.game->phase != catan::GamePhase::Robber) {
+            return jsonResponse(400, "{\"error\":\"Not in robber phase\"}");
+        }
+        
+        int hexQ = parseJsonInt(req.body, "hexQ", 0);
+        int hexR = parseJsonInt(req.body, "hexR", 0);
+        int stealFrom = parseJsonInt(req.body, "stealFromPlayerId", -1);
+        
+        // Move robber
+        catan::HexCoord oldLoc = ctx.game->board.robberLocation;
+        catan::HexCoord newLoc{hexQ, hexR};
+        
+        auto oldIt = ctx.game->board.hexes.find(oldLoc);
+        if (oldIt != ctx.game->board.hexes.end()) {
+            oldIt->second.hasRobber = false;
+        }
+        
+        auto newIt = ctx.game->board.hexes.find(newLoc);
+        if (newIt != ctx.game->board.hexes.end()) {
+            newIt->second.hasRobber = true;
+        }
+        ctx.game->board.robberLocation = newLoc;
+        
+        // Steal from player if specified
+        std::string stolenResource = "none";
+        if (stealFrom >= 0 && stealFrom < (int)ctx.game->players.size()) {
+            catan::Player* victim = &ctx.game->players[stealFrom];
+            if (victim->resources.total() > 0) {
+                // Randomly steal one resource
+                std::vector<catan::Resource> available;
+                if (victim->resources.wood > 0) available.push_back(catan::Resource::Wood);
+                if (victim->resources.brick > 0) available.push_back(catan::Resource::Brick);
+                if (victim->resources.wheat > 0) available.push_back(catan::Resource::Wheat);
+                if (victim->resources.sheep > 0) available.push_back(catan::Resource::Sheep);
+                if (victim->resources.ore > 0) available.push_back(catan::Resource::Ore);
+                
+                if (!available.empty()) {
+                    static std::random_device rd;
+                    static std::mt19937 gen(rd());
+                    std::uniform_int_distribution<> dis(0, available.size() - 1);
+                    catan::Resource stolen = available[dis(gen)];
+                    victim->resources[stolen]--;
+                    ctx.player->resources[stolen]++;
+                    stolenResource = resourceToString(stolen);
+                }
+            }
+        }
+        
+        ctx.game->phase = catan::GamePhase::MainTurn;
+        
+        return jsonResponse(200, 
+            "{\"success\":true,\"tool\":\"move_robber\","
+            "\"hexQ\":" + std::to_string(hexQ) +
+            ",\"hexR\":" + std::to_string(hexR) +
+            ",\"stolenResource\":\"" + stolenResource + "\"}");
+    }
+    
+    return jsonResponse(400, "{\"error\":\"Unknown tool: " + toolName + "\"}");
+}
+
+// Get information about pending AI turns
+std::string handleGetPendingAITurns(const HTTPRequest& req, const std::string& gameId) {
+    catan::Game* game = gameManager.getGame(gameId);
+    if (!game) {
+        return jsonResponse(404, "{\"error\":\"Game not found\"}");
+    }
+    
+    std::lock_guard<std::mutex> lock(game->mutex);
+    
+    catan::ai::AIPlayerManager aiManager(game);
+    
+    std::ostringstream json;
+    json << "{";
+    json << "\"currentPlayerIndex\":" << game->currentPlayerIndex;
+    json << ",\"currentPlayerIsAI\":" << (aiManager.isCurrentPlayerAI() ? "true" : "false");
+    json << ",\"phase\":\"" << static_cast<int>(game->phase) << "\"";
+    
+    if (aiManager.isCurrentPlayerAI()) {
+        auto& currentPlayer = game->players[game->currentPlayerIndex];
+        json << ",\"currentAIPlayer\":{";
+        json << "\"id\":" << currentPlayer.id;
+        json << ",\"name\":\"" << currentPlayer.name << "\"";
+        json << "}";
+    }
+    
+    int nextHuman = aiManager.getNextHumanPlayerIndex();
+    if (nextHuman >= 0) {
+        json << ",\"nextHumanPlayerIndex\":" << nextHuman;
+        json << ",\"nextHumanPlayerName\":\"" << game->players[nextHuman].name << "\"";
+    }
+    
+    json << ",\"humanCount\":" << aiManager.humanPlayerCount();
+    json << ",\"aiCount\":" << aiManager.aiPlayerCount();
+    json << "}";
+    
+    return jsonResponse(200, json.str());
 }
 
 // ============================================================================
@@ -644,6 +1162,11 @@ std::string routeRequest(const HTTPRequest& req) {
         return handleListGames(req);
     }
     
+    // GET /ai/tools - Get AI tool definitions (no auth needed)
+    if (req.method == "GET" && req.path == "/ai/tools") {
+        return handleGetAITools(req);
+    }
+    
     // Parse game-specific routes
     ParsedGamePath gamePath = parseGamePath(req.path);
     
@@ -651,6 +1174,11 @@ std::string routeRequest(const HTTPRequest& req) {
         // POST /games/{id}/join - Join a game
         if (req.method == "POST" && gamePath.action == "join") {
             return handleJoinGame(req, gamePath.gameId);
+        }
+        
+        // POST /games/{id}/add-ai - Add AI players to fill slots
+        if (req.method == "POST" && gamePath.action == "add-ai") {
+            return handleAddAIPlayers(req, gamePath.gameId);
         }
         
         // POST /games/{id}/start - Start the game
@@ -691,6 +1219,23 @@ std::string routeRequest(const HTTPRequest& req) {
         // POST /games/{id}/end-turn - End your turn
         if (req.method == "POST" && gamePath.action == "end-turn") {
             return handleEndTurn(req, gamePath.gameId);
+        }
+        
+        // ============ AI-SPECIFIC ENDPOINTS ============
+        
+        // GET /games/{id}/ai/state - Get AI game state for decision making
+        if (req.method == "GET" && gamePath.action == "ai/state") {
+            return handleGetAIState(req, gamePath.gameId);
+        }
+        
+        // POST /games/{id}/ai/execute - Execute an AI tool
+        if (req.method == "POST" && gamePath.action == "ai/execute") {
+            return handleExecuteAITool(req, gamePath.gameId);
+        }
+        
+        // GET /games/{id}/ai/pending - Get pending AI turns info
+        if (req.method == "GET" && gamePath.action == "ai/pending") {
+            return handleGetPendingAITurns(req, gamePath.gameId);
         }
         
         // GET /games/{id} - Get game state (requires auth)
@@ -771,7 +1316,8 @@ public:
         std::cout << "\n   LOBBY:" << std::endl;
         std::cout << "   POST /games              - Create a new game" << std::endl;
         std::cout << "   GET  /games              - List all games" << std::endl;
-        std::cout << "   POST /games/{id}/join    - Join a game" << std::endl;
+        std::cout << "   POST /games/{id}/join    - Join a game (body: {name, isAI})" << std::endl;
+        std::cout << "   POST /games/{id}/add-ai  - Add AI players to fill slots" << std::endl;
         std::cout << "   POST /games/{id}/start   - Start the game" << std::endl;
         std::cout << "   GET  /games/{id}         - Get game state" << std::endl;
         std::cout << "\n   GAMEPLAY: (require auth token)" << std::endl;
@@ -782,6 +1328,11 @@ public:
         std::cout << "   POST /games/{id}/buy/devcard    - Buy dev card" << std::endl;
         std::cout << "   POST /games/{id}/trade/bank     - Trade with bank (4:1)" << std::endl;
         std::cout << "   POST /games/{id}/end-turn       - End your turn" << std::endl;
+        std::cout << "\n   AI AGENT ENDPOINTS:" << std::endl;
+        std::cout << "   GET  /ai/tools                 - Get AI tool definitions" << std::endl;
+        std::cout << "   GET  /games/{id}/ai/state      - Get game state for AI" << std::endl;
+        std::cout << "   POST /games/{id}/ai/execute    - Execute AI tool" << std::endl;
+        std::cout << "   GET  /games/{id}/ai/pending    - Get pending AI turn info" << std::endl;
         std::cout << std::endl;
     }
 
