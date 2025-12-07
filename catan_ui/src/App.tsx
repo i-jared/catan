@@ -1,5 +1,6 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { api, type AITurnStatus, type LLMConfig } from './api';
+import { useState, useCallback, useEffect } from 'react';
+import { api, type LLMConfig } from './api';
+import { useGameEvents } from './useGameEvents';
 import type { GameState, StartGameResponse, ResourceHand, PlayerType } from './types';
 import './App.css';
 
@@ -257,67 +258,56 @@ interface GameBoardProps {
 
 function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps) {
   const [actionLog, setActionLog] = useState<string[]>([]);
-  const [aiStatus, setAIStatus] = useState<AITurnStatus | null>(null);
+  const [aiThinking, setAIThinking] = useState<{ playerId: number; playerName: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [llmProvider, setLLMProvider] = useState<string>('mock');
 
   const addToLog = useCallback((message: string) => {
     setActionLog(prev => [...prev.slice(-49), message]);
   }, []);
 
-  // Poll for AI status when AI is processing
+  // Use SSE for real-time updates
+  const { isConnected } = useGameEvents(gameId, {
+    onConnected: () => {
+      addToLog('📡 Connected to game events');
+    },
+    onDisconnected: () => {
+      addToLog('📡 Disconnected from game events');
+    },
+    onAIThinking: (event) => {
+      setAIThinking({ playerId: event.playerId, playerName: event.playerName });
+      addToLog(`🤔 ${event.playerName} is thinking...`);
+    },
+    onAIAction: (event) => {
+      addToLog(`🤖 ${event.playerName}: ${event.description}`);
+    },
+    onAITurnComplete: () => {
+      setAIThinking(null);
+      addToLog('✅ AI turns completed');
+      onGameUpdate();
+    },
+    onAIError: (errorMsg) => {
+      setAIThinking(null);
+      addToLog(`❌ AI Error: ${errorMsg}`);
+      setError(errorMsg);
+    },
+    onTurnChanged: (event) => {
+      addToLog(`🔄 Turn changed to ${event.playerName}`);
+      onGameUpdate();
+    },
+  });
+
+  // Load LLM provider info
   useEffect(() => {
-    const pollAIStatus = async () => {
-      try {
-        const status = await api.getAIStatus(gameId);
-        setAIStatus(status);
-
-        // Add new actions to log
-        if (status.recentActions.length > 0) {
-          const lastAction = status.recentActions[status.recentActions.length - 1];
-          addToLog(`🤖 ${lastAction.playerName}: ${lastAction.description}`);
-        }
-
-        // If AI finished, refresh game state
-        if (status.status === 'completed' || status.status === 'idle') {
-          if (!status.hasAIPendingTurns) {
-            onGameUpdate();
-            // Stop polling
-            if (pollingRef.current) {
-              clearInterval(pollingRef.current);
-              pollingRef.current = null;
-            }
-          }
-        }
-      } catch (err) {
-        console.error('Failed to poll AI status:', err);
-      }
-    };
-
-    // Start polling if AI is processing
-    if (aiStatus?.status === 'processing' || aiStatus?.hasAIPendingTurns) {
-      if (!pollingRef.current) {
-        pollingRef.current = setInterval(pollAIStatus, 1000);
-      }
-    }
-
-    return () => {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
-    };
-  }, [gameId, aiStatus?.status, aiStatus?.hasAIPendingTurns, addToLog, onGameUpdate]);
-
-  // Initial AI status check
-  useEffect(() => {
-    api.getAIStatus(gameId).then(setAIStatus).catch(console.error);
-  }, [gameId]);
+    api.getLLMConfig().then(config => {
+      setLLMProvider(config.provider);
+    }).catch(console.error);
+  }, []);
 
   const isMyTurn = gameState.currentPlayer === gameState.yourPlayerId;
   const currentPlayer = players.find(p => p.id === gameState.currentPlayer);
   const isCurrentPlayerAI = currentPlayer?.type === 'ai';
-  const isAIProcessing = aiStatus?.status === 'processing';
+  const isAIProcessing = aiThinking !== null;
 
   const handleRollDice = async () => {
     try {
@@ -337,39 +327,9 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
       const result = await api.endTurn(gameId);
       addToLog(`You ended your turn. Next: ${result.nextPlayerName}`);
       
-      // If AI processing started, begin polling
+      // If AI processing started, the SSE events will handle updates
       if (result.nextPlayerIsAI) {
         addToLog('🤖 AI players are taking their turns...');
-        // Refresh AI status to start polling
-        const status = await api.getAIStatus(gameId);
-        setAIStatus(status);
-        
-        // Start polling
-        if (!pollingRef.current) {
-          pollingRef.current = setInterval(async () => {
-            try {
-              const newStatus = await api.getAIStatus(gameId);
-              setAIStatus(newStatus);
-              
-              // Log new actions
-              if (newStatus.recentActions.length > 0) {
-                const lastAction = newStatus.recentActions[newStatus.recentActions.length - 1];
-                addToLog(`🤖 ${lastAction.playerName}: ${lastAction.description}`);
-              }
-              
-              // Stop when AI is done
-              if (!newStatus.hasAIPendingTurns && newStatus.status !== 'processing') {
-                if (pollingRef.current) {
-                  clearInterval(pollingRef.current);
-                  pollingRef.current = null;
-                }
-                onGameUpdate();
-              }
-            } catch (err) {
-              console.error('Polling error:', err);
-            }
-          }, 1000);
-        }
       } else {
         onGameUpdate();
       }
@@ -417,7 +377,10 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
         <div className="game-info">
           <span>Game: <code>{gameId}</code></span>
           <span>Phase: {phaseDisplay[gameState.phase] || gameState.phase}</span>
-          {aiStatus && <span>LLM: {aiStatus.llmProvider}</span>}
+          <span>LLM: {llmProvider}</span>
+          <span className={`connection-status ${isConnected ? 'connected' : 'disconnected'}`}>
+            {isConnected ? '🟢 Live' : '🔴 Offline'}
+          </span>
         </div>
       </div>
 
@@ -439,7 +402,7 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
               </div>
               {p.id === gameState.currentPlayer && (
                 <div className="turn-indicator">
-                  {isAIProcessing && p.type === 'ai' ? '⏳ Thinking...' : '▶ Current Turn'}
+                  {aiThinking?.playerId === p.id ? '⏳ Thinking...' : '▶ Current Turn'}
                 </div>
               )}
             </div>
@@ -530,9 +493,9 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
                 {isAIProcessing ? (
                   <div>
                     <span>🤖 AI players are thinking...</span>
-                    {aiStatus?.currentAIPlayerId !== undefined && aiStatus.currentAIPlayerId >= 0 && (
+                    {aiThinking && (
                       <div className="ai-current">
-                        Current: {players.find(p => p.id === aiStatus.currentAIPlayerId)?.name || 'AI'}
+                        Current: {aiThinking.playerName}
                       </div>
                     )}
                   </div>

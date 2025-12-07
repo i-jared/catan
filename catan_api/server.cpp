@@ -18,6 +18,7 @@
 #include "session.h"
 #include "ai_agent.h"
 #include "llm_provider.h"
+#include "sse_handler.h"
 
 // Global LLM config manager
 catan::ai::LLMConfigManager llmConfigManager;
@@ -1155,7 +1156,7 @@ catan::ai::AITurnExecutor* getOrCreateAIExecutor(const std::string& gameId) {
         return nullptr;
     }
     
-    auto executor = std::make_unique<catan::ai::AITurnExecutor>(game, llmConfigManager);
+    auto executor = std::make_unique<catan::ai::AITurnExecutor>(game, gameId, llmConfigManager);
     auto* ptr = executor.get();
     aiExecutors[gameId] = std::move(executor);
     return ptr;
@@ -1275,6 +1276,52 @@ std::string handleSetLLMConfig(const HTTPRequest& req) {
     llmConfigManager.setConfig(config);
     
     return jsonResponse(200, llmConfigManager.toJson());
+}
+
+// ============================================================================
+// SSE ENDPOINT HANDLER
+// ============================================================================
+
+// Handle SSE connection for game events
+// This function blocks and streams events - it doesn't return a normal response
+bool handleSSEGameEvents(int clientSocket, const std::string& gameId) {
+    catan::Game* game = gameManager.getGame(gameId);
+    if (!game) {
+        // Send error and close
+        std::string error = jsonResponse(404, "{\"error\":\"Game not found\"}");
+        send(clientSocket, error.c_str(), error.length(), 0);
+        return false;
+    }
+    
+    // Write SSE headers
+    if (!catan::SSEManager::writeSSEHeaders(clientSocket)) {
+        return false;
+    }
+    
+    // Register this client
+    catan::SSEClient* client = catan::sseManager.registerClient(clientSocket, gameId);
+    
+    // Send initial connection event
+    catan::SSEEvent connectEvent;
+    connectEvent.event = "connected";
+    connectEvent.data = "{\"gameId\":\"" + gameId + "\",\"message\":\"Connected to game events\"}";
+    connectEvent.id = catan::sseManager.nextEventId();
+    catan::sseManager.sendToClient(client, connectEvent);
+    
+    // Keep connection alive and handle events
+    // The actual events will be sent by the AI executor and other game actions
+    while (client->connected) {
+        // Send keepalive every 15 seconds
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+        
+        if (!catan::SSEManager::writeKeepalive(clientSocket)) {
+            break;
+        }
+    }
+    
+    // Cleanup
+    catan::sseManager.unregisterClient(client);
+    return true;
 }
 
 // ============================================================================
@@ -1472,6 +1519,28 @@ private:
             if (!req.authToken.empty()) {
                 std::cout << " [auth:" << req.authToken.substr(0, 8) << "...]";
             }
+            
+            // Check if this is an SSE request
+            auto acceptIt = req.headers.find("accept");
+            bool isSSE = (acceptIt != req.headers.end() && 
+                         acceptIt->second.find("text/event-stream") != std::string::npos);
+            
+            // Handle SSE requests for game events
+            if (isSSE && req.method == "GET" && req.path.substr(0, 7) == "/games/") {
+                std::string rest = req.path.substr(7);
+                size_t slashPos = rest.find('/');
+                std::string gameId = (slashPos != std::string::npos) ? rest.substr(0, slashPos) : rest;
+                std::string action = (slashPos != std::string::npos) ? rest.substr(slashPos + 1) : "";
+                
+                if (action == "events" || action == "sse") {
+                    std::cout << " [SSE]" << std::endl;
+                    // This blocks until the client disconnects
+                    handleSSEGameEvents(client_socket, gameId);
+                    // Don't close socket here - handleSSEGameEvents manages it
+                    return;
+                }
+            }
+            
             std::cout << std::endl;
 
             std::string response = routeRequest(req);
@@ -1529,6 +1598,8 @@ public:
         std::cout << "   POST /games/{id}/ai/stop       - Stop AI processing" << std::endl;
         std::cout << "   GET  /games/{id}/ai/status     - Get AI processing status" << std::endl;
         std::cout << "   GET  /games/{id}/ai/log        - Get AI action log" << std::endl;
+        std::cout << "\n   REAL-TIME EVENTS (SSE):" << std::endl;
+        std::cout << "   GET  /games/{id}/events        - Subscribe to game events (SSE)" << std::endl;
         std::cout << "\n   LLM CONFIGURATION:" << std::endl;
         std::cout << "   GET  /llm/config               - Get LLM config" << std::endl;
         std::cout << "   POST /llm/config               - Set LLM config (provider, apiKey, model)" << std::endl;

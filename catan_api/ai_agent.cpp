@@ -1,4 +1,5 @@
 #include "ai_agent.h"
+#include "sse_handler.h"
 #include <sstream>
 #include <random>
 
@@ -517,8 +518,8 @@ int AIPlayerManager::aiPlayerCount() const {
 // AI TURN EXECUTOR - Server-side AI turn processing
 // ============================================================================
 
-AITurnExecutor::AITurnExecutor(Game* game, LLMConfigManager& llmConfig)
-    : game(game), llmConfig(llmConfig) {}
+AITurnExecutor::AITurnExecutor(Game* game, const std::string& gameId, LLMConfigManager& llmConfig)
+    : game(game), gameId(gameId), llmConfig(llmConfig) {}
 
 AITurnExecutor::~AITurnExecutor() {
     stopProcessing();
@@ -1049,8 +1050,24 @@ void AITurnExecutor::processAITurns() {
         int playerId = game->currentPlayerIndex;
         currentAIPlayerId = playerId;
         
+        // Broadcast AI thinking event
+        if (playerId >= 0 && playerId < (int)game->players.size()) {
+            SSEEvent thinkingEvent;
+            thinkingEvent.event = GameEvents::AI_THINKING;
+            thinkingEvent.data = "{\"playerId\":" + std::to_string(playerId) + 
+                                ",\"playerName\":\"" + game->players[playerId].name + "\"}";
+            thinkingEvent.id = sseManager.nextEventId();
+            sseManager.broadcastToGame(gameId, thinkingEvent);
+        }
+        
         if (!processSingleAITurn(playerId)) {
-            // Error occurred
+            // Error occurred - broadcast error event
+            SSEEvent errorEvent;
+            errorEvent.event = GameEvents::AI_ERROR;
+            errorEvent.data = "{\"error\":\"" + lastError + "\"}";
+            errorEvent.id = sseManager.nextEventId();
+            sseManager.broadcastToGame(gameId, errorEvent);
+            
             status = Status::Error;
             return;
         }
@@ -1061,6 +1078,13 @@ void AITurnExecutor::processAITurns() {
     
     currentAIPlayerId = -1;
     status = Status::Completed;
+    
+    // Broadcast AI turns complete event
+    SSEEvent completeEvent;
+    completeEvent.event = GameEvents::AI_TURN_COMPLETE;
+    completeEvent.data = "{\"message\":\"All AI turns completed\"}";
+    completeEvent.id = sseManager.nextEventId();
+    sseManager.broadcastToGame(gameId, completeEvent);
 }
 
 bool AITurnExecutor::processSingleAITurn(int playerId) {
@@ -1155,6 +1179,14 @@ bool AITurnExecutor::processSingleAITurn(int playerId) {
             std::lock_guard<std::mutex> logLock(mutex);
             actionLog.push_back(logEntry);
         }
+        
+        // Broadcast SSE event
+        SSEEvent sseEvent = GameEvents::createAIActionEvent(
+            playerId, player->name, 
+            logEntry.action, logEntry.description, 
+            result.success
+        );
+        sseManager.broadcastToGame(gameId, sseEvent);
         
         // Add assistant message with tool call
         LLMMessage assistantMsg;

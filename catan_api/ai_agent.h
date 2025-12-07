@@ -12,6 +12,12 @@
 #include "catan_types.h"
 #include "llm_provider.h"
 
+// Forward declaration for SSE
+namespace catan {
+    class SSEManager;
+    extern SSEManager sseManager;
+}
+
 namespace catan {
 namespace ai {
 
@@ -250,6 +256,7 @@ public:
     
 private:
     Game* game;
+    std::string gameId;  // For SSE broadcasting
     LLMConfigManager& llmConfig;
     
     // Processing state
@@ -273,7 +280,7 @@ private:
     std::string describeAction(const std::string& toolName, const ToolResult& result) const;
     
 public:
-    AITurnExecutor(Game* game, LLMConfigManager& llmConfig);
+    AITurnExecutor(Game* game, const std::string& gameId, LLMConfigManager& llmConfig);
     ~AITurnExecutor();
     
     // Start processing AI turns (non-blocking)
