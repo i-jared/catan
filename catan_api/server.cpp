@@ -17,6 +17,17 @@
 #include "catan_types.h"
 #include "session.h"
 #include "ai_agent.h"
+#include "llm_provider.h"
+
+// Global LLM config manager
+catan::ai::LLMConfigManager llmConfigManager;
+
+// Map of game ID to AI turn executor
+std::unordered_map<std::string, std::unique_ptr<catan::ai::AITurnExecutor>> aiExecutors;
+std::mutex aiExecutorsMutex;
+
+// Forward declaration
+catan::ai::AITurnExecutor* getOrCreateAIExecutor(const std::string& gameId);
 
 // Global managers (in production, wrap these properly)
 catan::GameManager gameManager;
@@ -674,6 +685,15 @@ std::string handleEndTurn(const HTTPRequest& req, const std::string& gameId) {
     bool nextIsAI = aiManager.isCurrentPlayerAI();
     int nextHumanIndex = aiManager.getNextHumanPlayerIndex();
     
+    // If next player is AI, automatically start AI turn processing
+    bool aiProcessingStarted = false;
+    if (nextIsAI) {
+        auto* executor = getOrCreateAIExecutor(gameId);
+        if (executor) {
+            aiProcessingStarted = executor->startProcessing();
+        }
+    }
+    
     std::ostringstream json;
     json << "{\"success\":true";
     json << ",\"nextPlayer\":" << ctx.game->currentPlayerIndex;
@@ -683,6 +703,7 @@ std::string handleEndTurn(const HTTPRequest& req, const std::string& gameId) {
     // If next player is AI, include info about when control returns to a human
     if (nextIsAI) {
         json << ",\"pendingAITurns\":true";
+        json << ",\"aiProcessingStarted\":" << (aiProcessingStarted ? "true" : "false");
         if (nextHumanIndex >= 0) {
             json << ",\"nextHumanPlayerIndex\":" << nextHumanIndex;
             json << ",\"nextHumanPlayerName\":\"" << ctx.game->players[nextHumanIndex].name << "\"";
@@ -1117,6 +1138,146 @@ std::string handleGetPendingAITurns(const HTTPRequest& req, const std::string& g
 }
 
 // ============================================================================
+// SERVER-SIDE AI TURN PROCESSING
+// ============================================================================
+
+// Get or create AI executor for a game
+catan::ai::AITurnExecutor* getOrCreateAIExecutor(const std::string& gameId) {
+    std::lock_guard<std::mutex> lock(aiExecutorsMutex);
+    
+    auto it = aiExecutors.find(gameId);
+    if (it != aiExecutors.end()) {
+        return it->second.get();
+    }
+    
+    catan::Game* game = gameManager.getGame(gameId);
+    if (!game) {
+        return nullptr;
+    }
+    
+    auto executor = std::make_unique<catan::ai::AITurnExecutor>(game, llmConfigManager);
+    auto* ptr = executor.get();
+    aiExecutors[gameId] = std::move(executor);
+    return ptr;
+}
+
+// Start AI turn processing for a game
+std::string handleStartAITurns(const HTTPRequest& req, const std::string& gameId) {
+    catan::Game* game = gameManager.getGame(gameId);
+    if (!game) {
+        return jsonResponse(404, "{\"error\":\"Game not found\"}");
+    }
+    
+    auto* executor = getOrCreateAIExecutor(gameId);
+    if (!executor) {
+        return jsonResponse(500, "{\"error\":\"Failed to create AI executor\"}");
+    }
+    
+    bool started = executor->startProcessing();
+    
+    std::ostringstream json;
+    json << "{";
+    json << "\"started\":" << (started ? "true" : "false");
+    json << ",\"status\":\"" << (started ? "processing" : "already_running_or_no_ai_turns") << "\"";
+    json << ",\"llmProvider\":\"" << llmConfigManager.getConfig().provider << "\"";
+    json << "}";
+    
+    return jsonResponse(200, json.str());
+}
+
+// Stop AI turn processing for a game
+std::string handleStopAITurns(const HTTPRequest& req, const std::string& gameId) {
+    std::lock_guard<std::mutex> lock(aiExecutorsMutex);
+    
+    auto it = aiExecutors.find(gameId);
+    if (it == aiExecutors.end()) {
+        return jsonResponse(200, "{\"stopped\":true,\"message\":\"No AI processing was running\"}");
+    }
+    
+    it->second->stopProcessing();
+    
+    return jsonResponse(200, "{\"stopped\":true}");
+}
+
+// Get AI turn processing status
+std::string handleGetAITurnStatus(const HTTPRequest& req, const std::string& gameId) {
+    catan::Game* game = gameManager.getGame(gameId);
+    if (!game) {
+        return jsonResponse(404, "{\"error\":\"Game not found\"}");
+    }
+    
+    auto* executor = getOrCreateAIExecutor(gameId);
+    if (!executor) {
+        return jsonResponse(500, "{\"error\":\"Failed to get AI executor\"}");
+    }
+    
+    return jsonResponse(200, executor->statusToJson());
+}
+
+// Get AI action log for a game
+std::string handleGetAIActionLog(const HTTPRequest& req, const std::string& gameId) {
+    std::lock_guard<std::mutex> lock(aiExecutorsMutex);
+    
+    auto it = aiExecutors.find(gameId);
+    if (it == aiExecutors.end()) {
+        return jsonResponse(200, "{\"actions\":[]}");
+    }
+    
+    auto actions = it->second->getActionLog(100);
+    
+    std::ostringstream json;
+    json << "{\"actions\":[";
+    for (size_t i = 0; i < actions.size(); i++) {
+        if (i > 0) json << ",";
+        const auto& a = actions[i];
+        json << "{";
+        json << "\"playerId\":" << a.playerId;
+        json << ",\"playerName\":\"" << a.playerName << "\"";
+        json << ",\"action\":\"" << a.action << "\"";
+        json << ",\"description\":\"" << a.description << "\"";
+        json << ",\"success\":" << (a.success ? "true" : "false");
+        if (!a.error.empty()) {
+            json << ",\"error\":\"" << a.error << "\"";
+        }
+        json << "}";
+    }
+    json << "]}";
+    
+    return jsonResponse(200, json.str());
+}
+
+// ============================================================================
+// LLM CONFIGURATION ENDPOINTS
+// ============================================================================
+
+// Get current LLM configuration
+std::string handleGetLLMConfig(const HTTPRequest& req) {
+    return jsonResponse(200, llmConfigManager.toJson());
+}
+
+// Set LLM configuration
+std::string handleSetLLMConfig(const HTTPRequest& req) {
+    std::string provider = parseJsonString(req.body, "provider");
+    std::string apiKey = parseJsonString(req.body, "apiKey");
+    std::string model = parseJsonString(req.body, "model");
+    std::string baseUrl = parseJsonString(req.body, "baseUrl");
+    
+    if (provider.empty()) {
+        return jsonResponse(400, "{\"error\":\"Missing provider\"}");
+    }
+    
+    catan::ai::LLMConfig config;
+    config.provider = provider;
+    config.apiKey = apiKey;
+    config.model = model;
+    config.baseUrl = baseUrl;
+    
+    llmConfigManager.setConfig(config);
+    
+    return jsonResponse(200, llmConfigManager.toJson());
+}
+
+// ============================================================================
 // REQUEST ROUTER
 // ============================================================================
 
@@ -1165,6 +1326,18 @@ std::string routeRequest(const HTTPRequest& req) {
     // GET /ai/tools - Get AI tool definitions (no auth needed)
     if (req.method == "GET" && req.path == "/ai/tools") {
         return handleGetAITools(req);
+    }
+    
+    // ============ LLM CONFIGURATION ============
+    
+    // GET /llm/config - Get LLM configuration
+    if (req.method == "GET" && req.path == "/llm/config") {
+        return handleGetLLMConfig(req);
+    }
+    
+    // POST /llm/config - Set LLM configuration
+    if (req.method == "POST" && req.path == "/llm/config") {
+        return handleSetLLMConfig(req);
     }
     
     // Parse game-specific routes
@@ -1221,14 +1394,36 @@ std::string routeRequest(const HTTPRequest& req) {
             return handleEndTurn(req, gamePath.gameId);
         }
         
-        // ============ AI-SPECIFIC ENDPOINTS ============
+        // ============ SERVER-SIDE AI TURN PROCESSING ============
+        
+        // POST /games/{id}/ai/start - Start AI turn processing
+        if (req.method == "POST" && gamePath.action == "ai/start") {
+            return handleStartAITurns(req, gamePath.gameId);
+        }
+        
+        // POST /games/{id}/ai/stop - Stop AI turn processing
+        if (req.method == "POST" && gamePath.action == "ai/stop") {
+            return handleStopAITurns(req, gamePath.gameId);
+        }
+        
+        // GET /games/{id}/ai/status - Get AI processing status
+        if (req.method == "GET" && gamePath.action == "ai/status") {
+            return handleGetAITurnStatus(req, gamePath.gameId);
+        }
+        
+        // GET /games/{id}/ai/log - Get AI action log
+        if (req.method == "GET" && gamePath.action == "ai/log") {
+            return handleGetAIActionLog(req, gamePath.gameId);
+        }
+        
+        // ============ AI STATE ENDPOINTS (for external AI) ============
         
         // GET /games/{id}/ai/state - Get AI game state for decision making
         if (req.method == "GET" && gamePath.action == "ai/state") {
             return handleGetAIState(req, gamePath.gameId);
         }
         
-        // POST /games/{id}/ai/execute - Execute an AI tool
+        // POST /games/{id}/ai/execute - Execute an AI tool (for external AI)
         if (req.method == "POST" && gamePath.action == "ai/execute") {
             return handleExecuteAITool(req, gamePath.gameId);
         }
@@ -1249,7 +1444,8 @@ std::string routeRequest(const HTTPRequest& req) {
         return jsonResponse(200, 
             "{\"status\":\"ok\","
             "\"activeGames\":" + std::to_string(gameManager.gameCount()) + ","
-            "\"activeSessions\":" + std::to_string(sessionManager.activeSessionCount()) + "}");
+            "\"activeSessions\":" + std::to_string(sessionManager.activeSessionCount()) + ","
+            "\"llmProvider\":\"" + llmConfigManager.getConfig().provider + "\"}");
     }
     
     return jsonResponse(404, "{\"error\":\"Not found\"}");
@@ -1327,12 +1523,17 @@ public:
         std::cout << "   POST /games/{id}/buy/city       - Buy a city" << std::endl;
         std::cout << "   POST /games/{id}/buy/devcard    - Buy dev card" << std::endl;
         std::cout << "   POST /games/{id}/trade/bank     - Trade with bank (4:1)" << std::endl;
-        std::cout << "   POST /games/{id}/end-turn       - End your turn" << std::endl;
-        std::cout << "\n   AI AGENT ENDPOINTS:" << std::endl;
-        std::cout << "   GET  /ai/tools                 - Get AI tool definitions" << std::endl;
-        std::cout << "   GET  /games/{id}/ai/state      - Get game state for AI" << std::endl;
-        std::cout << "   POST /games/{id}/ai/execute    - Execute AI tool" << std::endl;
-        std::cout << "   GET  /games/{id}/ai/pending    - Get pending AI turn info" << std::endl;
+        std::cout << "   POST /games/{id}/end-turn       - End your turn (auto-triggers AI)" << std::endl;
+        std::cout << "\n   SERVER-SIDE AI (auto-runs when AI player's turn):" << std::endl;
+        std::cout << "   POST /games/{id}/ai/start      - Manually start AI processing" << std::endl;
+        std::cout << "   POST /games/{id}/ai/stop       - Stop AI processing" << std::endl;
+        std::cout << "   GET  /games/{id}/ai/status     - Get AI processing status" << std::endl;
+        std::cout << "   GET  /games/{id}/ai/log        - Get AI action log" << std::endl;
+        std::cout << "\n   LLM CONFIGURATION:" << std::endl;
+        std::cout << "   GET  /llm/config               - Get LLM config" << std::endl;
+        std::cout << "   POST /llm/config               - Set LLM config (provider, apiKey, model)" << std::endl;
+        std::cout << "\n   Current LLM: " << llmConfigManager.getConfig().provider << std::endl;
+        std::cout << "   (Set ANTHROPIC_API_KEY or OPENAI_API_KEY env var to auto-configure)" << std::endl;
         std::cout << std::endl;
     }
 

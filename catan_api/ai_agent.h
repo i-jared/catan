@@ -4,7 +4,13 @@
 #include <vector>
 #include <functional>
 #include <optional>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 #include "catan_types.h"
+#include "llm_provider.h"
 
 namespace catan {
 namespace ai {
@@ -190,19 +196,6 @@ struct AITurnResult {
     std::string error;
 };
 
-// Interface for external LLM integration
-// The actual LLM call happens outside this module
-class AITurnCallback {
-public:
-    virtual ~AITurnCallback() = default;
-    
-    // Called to get the AI's next action
-    // Returns a ToolCall with the tool name and arguments
-    // Return empty toolName to indicate turn is complete
-    virtual ToolCall getNextAction(const AIGameState& state, 
-                                   const std::vector<ToolResult>& previousResults) = 0;
-};
-
 // Process a single AI turn
 // This executes tools one by one until the AI ends their turn
 class AITurnProcessor {
@@ -224,6 +217,98 @@ public:
     
     // Get current game state for AI
     AIGameState getCurrentState() const;
+};
+
+// ============================================================================
+// AI TURN ACTION LOG
+// Records actions taken during AI turns for UI display
+// ============================================================================
+
+struct AIActionLogEntry {
+    int playerId;
+    std::string playerName;
+    std::string action;         // Tool name
+    std::string description;    // Human-readable description
+    bool success;
+    std::string error;
+    std::chrono::steady_clock::time_point timestamp;
+};
+
+// ============================================================================
+// SERVER-SIDE AI TURN EXECUTOR
+// Handles processing AI turns on the server using LLM providers
+// ============================================================================
+
+class AITurnExecutor {
+public:
+    enum class Status {
+        Idle,
+        Processing,
+        Completed,
+        Error
+    };
+    
+private:
+    Game* game;
+    LLMConfigManager& llmConfig;
+    
+    // Processing state
+    std::atomic<Status> status{Status::Idle};
+    std::atomic<bool> shouldStop{false};
+    std::thread processingThread;
+    mutable std::mutex mutex;
+    
+    // Action log
+    mutable std::vector<AIActionLogEntry> actionLog;
+    
+    // Current processing info
+    int currentAIPlayerId = -1;
+    std::string lastError;
+    
+    // Helper methods
+    std::string buildSystemPrompt() const;
+    std::string buildUserMessage(const AIGameState& state) const;
+    std::vector<LLMTool> buildToolList() const;
+    ToolResult executeToolCall(const LLMToolCall& toolCall, int playerId);
+    std::string describeAction(const std::string& toolName, const ToolResult& result) const;
+    
+public:
+    AITurnExecutor(Game* game, LLMConfigManager& llmConfig);
+    ~AITurnExecutor();
+    
+    // Start processing AI turns (non-blocking)
+    bool startProcessing();
+    
+    // Stop processing
+    void stopProcessing();
+    
+    // Check status
+    Status getStatus() const { return status.load(); }
+    
+    // Get current AI player being processed
+    int getCurrentAIPlayerId() const { return currentAIPlayerId; }
+    
+    // Get action log (recent actions)
+    std::vector<AIActionLogEntry> getActionLog(size_t maxEntries = 50) const;
+    
+    // Clear action log
+    void clearActionLog();
+    
+    // Get last error
+    std::string getLastError() const { return lastError; }
+    
+    // Check if any AI players need to take their turn
+    bool hasAIPendingTurns() const;
+    
+    // Get status as JSON
+    std::string statusToJson() const;
+    
+private:
+    // Main processing loop (runs in thread)
+    void processAITurns();
+    
+    // Process a single AI player's turn
+    bool processSingleAITurn(int playerId);
 };
 
 // ============================================================================

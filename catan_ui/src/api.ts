@@ -4,14 +4,39 @@ import type {
   GameState,
   AIGameState,
   EndTurnResponse,
-  AddAIResponse,
   RollDiceResponse,
-  AIToolResult,
   AIToolDefinition,
   PendingAITurnsInfo,
 } from './types';
 
 const API_BASE = 'http://localhost:8080';
+
+// ============================================================================
+// AI STATUS TYPES
+// ============================================================================
+
+export interface AITurnStatus {
+  status: 'idle' | 'processing' | 'completed' | 'error';
+  currentAIPlayerId: number;
+  error?: string;
+  hasAIPendingTurns: boolean;
+  llmProvider: string;
+  recentActions: Array<{
+    playerId: number;
+    playerName: string;
+    action: string;
+    description: string;
+    success: boolean;
+    error?: string;
+  }>;
+}
+
+export interface LLMConfig {
+  provider: string;
+  model: string;
+  configured: boolean;
+  availableProviders: string[];
+}
 
 // ============================================================================
 // API CLIENT
@@ -82,7 +107,11 @@ class CatanAPI {
     );
   }
 
-  async addAIPlayers(gameId: string, count?: number): Promise<AddAIResponse> {
+  async addAIPlayers(gameId: string, count?: number): Promise<{
+    success: boolean;
+    addedCount: number;
+    totalPlayers: number;
+  }> {
     return this.request('POST', `/games/${gameId}/add-ai`, { count }, true);
   }
 
@@ -126,35 +155,57 @@ class CatanAPI {
     return this.request('POST', `/games/${gameId}/trade/bank`, { give, receive });
   }
 
-  async endTurn(gameId: string): Promise<EndTurnResponse> {
+  async endTurn(gameId: string): Promise<EndTurnResponse & { aiProcessingStarted?: boolean }> {
     return this.request('POST', `/games/${gameId}/end-turn`);
   }
 
   // ============================================================================
-  // AI ENDPOINTS
+  // SERVER-SIDE AI ENDPOINTS
   // ============================================================================
 
-  async getAITools(): Promise<{ tools: AIToolDefinition[] }> {
-    return this.request('GET', '/ai/tools', undefined, false);
+  async startAITurns(gameId: string): Promise<{ started: boolean; status: string; llmProvider: string }> {
+    return this.request('POST', `/games/${gameId}/ai/start`, undefined, false);
+  }
+
+  async stopAITurns(gameId: string): Promise<{ stopped: boolean }> {
+    return this.request('POST', `/games/${gameId}/ai/stop`, undefined, false);
+  }
+
+  async getAIStatus(gameId: string): Promise<AITurnStatus> {
+    return this.request('GET', `/games/${gameId}/ai/status`, undefined, false);
+  }
+
+  async getAILog(gameId: string): Promise<{ actions: AITurnStatus['recentActions'] }> {
+    return this.request('GET', `/games/${gameId}/ai/log`, undefined, false);
   }
 
   async getAIState(gameId: string): Promise<AIGameState> {
     return this.request('GET', `/games/${gameId}/ai/state`);
   }
 
-  async executeAITool(
-    gameId: string,
-    tool: string,
-    params?: object
-  ): Promise<AIToolResult> {
-    return this.request('POST', `/games/${gameId}/ai/execute`, {
-      tool,
-      ...params,
-    });
-  }
-
   async getPendingAITurns(gameId: string): Promise<PendingAITurnsInfo> {
     return this.request('GET', `/games/${gameId}/ai/pending`, undefined, false);
+  }
+
+  // ============================================================================
+  // LLM CONFIGURATION
+  // ============================================================================
+
+  async getLLMConfig(): Promise<LLMConfig> {
+    return this.request('GET', '/llm/config', undefined, false);
+  }
+
+  async setLLMConfig(config: {
+    provider: string;
+    apiKey?: string;
+    model?: string;
+    baseUrl?: string;
+  }): Promise<LLMConfig> {
+    return this.request('POST', '/llm/config', config, false);
+  }
+
+  async getAITools(): Promise<{ tools: AIToolDefinition[] }> {
+    return this.request('GET', '/ai/tools', undefined, false);
   }
 }
 

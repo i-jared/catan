@@ -1,19 +1,20 @@
 # Catan with AI Agents
 
-A Catan board game implementation with support for human players and LLM-powered AI agents.
+A Catan board game implementation with support for human players and LLM-powered AI agents. **AI execution happens server-side** with support for multiple LLM providers.
 
 ## Features
 
 - **Human + AI Gameplay**: Play against LLM agents that use tools to make decisions
-- **Flexible Player Configuration**: Currently supports 1 human + 3 AI, but designed to easily extend to multiple humans
-- **Automatic AI Turns**: When a human ends their turn, AI players automatically take their turns in sequence
-- **Tool-based AI System**: AI agents interact with the game through a defined set of tools (roll dice, build, trade, etc.)
+- **Server-Side AI Execution**: All AI logic runs on the server - secure and consistent
+- **Multiple LLM Providers**: Switch between Anthropic (Claude), OpenAI (GPT), or mock AI
+- **Automatic AI Turns**: When a human ends their turn, AI players automatically take their turns
+- **Real-time Updates**: Frontend polls for AI status and shows action log
 
 ## Architecture
 
 ### Backend (C++)
 
-The server provides a REST API for game management:
+The server handles all game logic and AI execution:
 
 ```
 LOBBY:
@@ -31,40 +32,43 @@ GAMEPLAY:
   POST /games/{id}/buy/city       - Buy a city
   POST /games/{id}/buy/devcard    - Buy dev card
   POST /games/{id}/trade/bank     - Trade with bank (4:1)
-  POST /games/{id}/end-turn       - End your turn
+  POST /games/{id}/end-turn       - End your turn (auto-triggers AI)
 
-AI AGENT ENDPOINTS:
-  GET  /ai/tools                 - Get AI tool definitions (JSON schema)
-  GET  /games/{id}/ai/state      - Get game state formatted for AI decision making
-  POST /games/{id}/ai/execute    - Execute an AI tool
-  GET  /games/{id}/ai/pending    - Get pending AI turn info
+SERVER-SIDE AI (auto-runs when AI player's turn):
+  POST /games/{id}/ai/start       - Manually start AI processing
+  POST /games/{id}/ai/stop        - Stop AI processing
+  GET  /games/{id}/ai/status      - Get AI processing status + action log
+  GET  /games/{id}/ai/log         - Get full AI action log
+
+LLM CONFIGURATION:
+  GET  /llm/config                - Get current LLM config
+  POST /llm/config                - Set LLM config (provider, apiKey, model)
 ```
+
+### LLM Providers
+
+The server supports multiple LLM providers:
+
+| Provider | Models | Setup |
+|----------|--------|-------|
+| `mock` | N/A | Default, no API key needed |
+| `anthropic` | claude-sonnet-4-20250514, etc | Set `ANTHROPIC_API_KEY` env var |
+| `openai` | gpt-4, gpt-4-turbo, etc | Set `OPENAI_API_KEY` env var |
+
+**Configuration methods:**
+1. Environment variables (auto-detected on startup)
+2. POST to `/llm/config` with `{provider, apiKey, model}`
+3. UI configuration panel in the lobby
 
 ### Frontend (React + TypeScript)
 
 The UI handles:
-- Game lobby (create/join game, add AI players)
+- Game lobby (create/join game, add AI players, configure LLM)
 - Game board display with resources and actions
-- AI turn processing (calls LLM for decisions, executes tools)
+- Polling for AI status during AI turns
 - Action log showing all game events
 
-### AI Agent System
-
-AI players use a tool-based system similar to function calling:
-
-**Available Tools:**
-- `roll_dice` - Roll dice to start turn
-- `build_road` - Build a road (1 wood + 1 brick)
-- `build_settlement` - Build a settlement (1 each wood/brick/wheat/sheep)
-- `build_city` - Upgrade to city (2 wheat + 3 ore)
-- `buy_dev_card` - Buy development card (1 each wheat/sheep/ore)
-- `bank_trade` - Trade 4:1 with bank
-- `move_robber` - Move robber after rolling 7
-- `play_knight` - Play Knight card
-- `play_road_building` - Play Road Building card
-- `play_year_of_plenty` - Play Year of Plenty card
-- `play_monopoly` - Play Monopoly card
-- `end_turn` - End current turn
+The frontend **does not** execute AI logic - it simply polls the server for status updates.
 
 ## Getting Started
 
@@ -74,8 +78,9 @@ AI players use a tool-based system similar to function calling:
 cd catan_api
 g++ -std=c++17 -c -o catan_game.o catan_game.cpp
 g++ -std=c++17 -c -o ai_agent.o ai_agent.cpp
+g++ -std=c++17 -c -o llm_provider.o llm_provider.cpp
 g++ -std=c++17 -c -o server.o server.cpp
-g++ -std=c++17 -o catan_server server.o catan_game.o ai_agent.o -lpthread
+g++ -std=c++17 -o catan_server server.o catan_game.o ai_agent.o llm_provider.o -lpthread
 ./catan_server
 ```
 
@@ -88,35 +93,71 @@ npm run dev  # Development
 npm run build  # Production
 ```
 
+### Using Real LLM Providers
+
+**Option 1: Environment Variables**
+```bash
+# For Anthropic Claude
+export ANTHROPIC_API_KEY=your_key_here
+./catan_server
+
+# For OpenAI GPT
+export OPENAI_API_KEY=your_key_here
+./catan_server
+```
+
+**Option 2: API Configuration**
+```bash
+# Set provider via API
+curl -X POST http://localhost:8080/llm/config \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"anthropic","apiKey":"your_key","model":"claude-sonnet-4-20250514"}'
+```
+
+**Option 3: UI Configuration**
+Use the LLM configuration panel in the game lobby.
+
+## How it Works
+
+1. Human creates a game and joins
+2. Configure LLM provider (or use mock for testing)
+3. Click "Fill with AI Players" to add 3 AI players
+4. Start the game
+5. Human takes their turn (roll dice, build, trade, etc.)
+6. When human clicks "End Turn":
+   - Server automatically starts AI turn processing
+   - Each AI player calls the configured LLM for decisions
+   - LLM returns tool calls (roll_dice, build_road, end_turn, etc.)
+   - Server executes the tools and advances the game
+   - Frontend polls for status updates and shows action log
+   - Control returns to human when all AI turns complete
+
+## AI Tool System
+
+The AI uses a tool-based system similar to function calling:
+
+**Available Tools:**
+- `roll_dice` - Roll dice to start turn
+- `build_road` - Build a road (1 wood + 1 brick)
+- `build_settlement` - Build a settlement (1 each wood/brick/wheat/sheep)
+- `build_city` - Upgrade to city (2 wheat + 3 ore)
+- `buy_dev_card` - Buy development card (1 each wheat/sheep/ore)
+- `bank_trade` - Trade 4:1 with bank
+- `move_robber` - Move robber after rolling 7
+- `play_knight` - Play Knight card
+- `end_turn` - End current turn
+
 ## Extending for Multiple Humans
 
 The system is designed for easy extension to multiple human players:
 
 1. **Player Type Tracking**: Each player has a `PlayerType` (Human/AI)
 2. **Session Tokens**: Each player (human or AI) has their own auth token
-3. **Turn Detection**: The `AIPlayerManager` identifies which players are AI vs human
-4. **UI State**: The frontend tracks which players are human to show appropriate UI
+3. **Turn Detection**: Server identifies which players are AI vs human
+4. **Automatic Processing**: AI turns process automatically after any human ends their turn
 
 To add multiple human support:
-1. Allow multiple users to join the same game
+1. Allow multiple browser sessions to join the same game
 2. Each human gets their own session token
-3. Show turn notifications to all connected humans
-4. AI turn processing happens after ANY human ends their turn (not just a specific one)
-
-## LLM Integration
-
-The current implementation uses a mock LLM (`aiAgent.ts`). To integrate a real LLM:
-
-1. Implement the `getAIDecision()` method in `AIAgentProcessor`
-2. Send the `AIGameState` to your LLM with the tool definitions
-3. Parse the LLM's tool call response
-4. Execute the tool via the API
-
-Supported LLM providers can be configured via `LLMConfig`:
-```typescript
-{
-  provider: 'anthropic' | 'openai' | 'mock',
-  apiKey: string,
-  model: string
-}
-```
+3. Add WebSocket support for real-time turn notifications
+4. AI turn processing triggers after any human ends their turn

@@ -1,8 +1,95 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { api } from './api';
-import { initializeAIProcessor, type AITurnEvent, type AIAgentProcessor } from './aiAgent';
+import { api, type AITurnStatus, type LLMConfig } from './api';
 import type { GameState, StartGameResponse, ResourceHand, PlayerType } from './types';
 import './App.css';
+
+// ============================================================================
+// LLM CONFIG COMPONENT
+// ============================================================================
+
+interface LLMConfigPanelProps {
+  config: LLMConfig | null;
+  onConfigChange: () => void;
+}
+
+function LLMConfigPanel({ config, onConfigChange }: LLMConfigPanelProps) {
+  const [provider, setProvider] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [model, setModel] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (config) {
+      setProvider(config.provider);
+    }
+  }, [config]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await api.setLLMConfig({
+        provider,
+        apiKey: apiKey || undefined,
+        model: model || undefined,
+      });
+      onConfigChange();
+      setApiKey(''); // Clear API key from UI
+    } catch (err) {
+      console.error('Failed to save LLM config:', err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!config) return null;
+
+  return (
+    <div className="llm-config-panel">
+      <h4>🤖 LLM Provider</h4>
+      <div className="config-row">
+        <label>Provider:</label>
+        <select value={provider} onChange={(e) => setProvider(e.target.value)}>
+          {config.availableProviders.map(p => (
+            <option key={p} value={p}>{p}</option>
+          ))}
+        </select>
+      </div>
+      {provider !== 'mock' && (
+        <>
+          <div className="config-row">
+            <label>API Key:</label>
+            <input
+              type="password"
+              placeholder="Enter API key..."
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+            />
+          </div>
+          <div className="config-row">
+            <label>Model:</label>
+            <input
+              type="text"
+              placeholder={provider === 'anthropic' ? 'claude-sonnet-4-20250514' : 'gpt-4'}
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+            />
+          </div>
+        </>
+      )}
+      <button 
+        onClick={handleSave} 
+        disabled={saving}
+        className="btn-secondary"
+      >
+        {saving ? 'Saving...' : 'Save Config'}
+      </button>
+      <div className="config-status">
+        Status: {config.configured ? '✅ Configured' : '⚠️ Not configured'}
+        {config.model && ` (${config.model})`}
+      </div>
+    </div>
+  );
+}
 
 // ============================================================================
 // GAME LOBBY COMPONENT
@@ -18,7 +105,16 @@ function Lobby({ onGameStarted }: LobbyProps) {
   const [joined, setJoined] = useState(false);
   const [players, setPlayers] = useState<Array<{ id: number; name: string; type: PlayerType }>>([]);
   const [error, setError] = useState<string | null>(null);
-  const [aiTokens, setAiTokens] = useState<Map<number, string>>(new Map());
+  const [llmConfig, setLLMConfig] = useState<LLMConfig | null>(null);
+
+  useEffect(() => {
+    // Load LLM config on mount
+    api.getLLMConfig().then(setLLMConfig).catch(console.error);
+  }, []);
+
+  const refreshLLMConfig = () => {
+    api.getLLMConfig().then(setLLMConfig).catch(console.error);
+  };
 
   const createGame = async () => {
     try {
@@ -47,34 +143,28 @@ function Lobby({ onGameStarted }: LobbyProps) {
     if (!gameId) return;
     try {
       const humanToken = api.getAuthToken();
-      const newAiTokens = new Map(aiTokens);
-      const updatedPlayers = [...players];
       
       // AI player names
       const aiNames = ['Claude', 'GPT', 'Gemini', 'LLaMA', 'Mistral', 'Falcon', 'Cohere'];
+      const updatedPlayers = [...players];
       
-      // Add AI players one by one to get their tokens
+      // Add AI players one by one
       const slotsToFill = 4 - players.length;
       for (let i = 0; i < slotsToFill; i++) {
         const aiName = aiNames[(players.length + i) % aiNames.length] + ' (AI)';
         
-        // Join as AI player to get token
         const savedToken = api.getAuthToken();
         const aiJoinResult = await api.joinGame(gameId, aiName, true);
-        newAiTokens.set(aiJoinResult.playerId, aiJoinResult.token);
         updatedPlayers.push({ id: aiJoinResult.playerId, name: aiJoinResult.playerName, type: 'ai' });
         
-        // Restore human token
         if (savedToken) {
           api.setAuthToken(savedToken);
         }
       }
       
-      setAiTokens(newAiTokens);
       setPlayers(updatedPlayers);
       setError(null);
       
-      // Restore human token
       if (humanToken) {
         api.setAuthToken(humanToken);
       }
@@ -87,14 +177,7 @@ function Lobby({ onGameStarted }: LobbyProps) {
     if (!gameId) return;
     try {
       const result = await api.startGame(gameId);
-      
-      // Pass AI tokens to the game
-      const gameInfo = {
-        ...result,
-        aiTokens,
-      };
-      
-      onGameStarted(gameId, gameInfo as StartGameResponse & { aiTokens: Map<number, string> });
+      onGameStarted(gameId, result);
     } catch (err) {
       setError(`Failed to start game: ${err}`);
     }
@@ -109,6 +192,7 @@ function Lobby({ onGameStarted }: LobbyProps) {
       {!gameId ? (
         <div className="lobby-section">
           <h2>Create New Game</h2>
+          <LLMConfigPanel config={llmConfig} onConfigChange={refreshLLMConfig} />
           <button onClick={createGame} className="btn-primary">Create Game</button>
         </div>
       ) : !joined ? (
@@ -129,6 +213,8 @@ function Lobby({ onGameStarted }: LobbyProps) {
         <div className="lobby-section">
           <h2>Game Lobby</h2>
           <p>Game ID: <code>{gameId}</code></p>
+          
+          <LLMConfigPanel config={llmConfig} onConfigChange={refreshLLMConfig} />
           
           <div className="players-list">
             <h3>Players ({players.length}/4)</h3>
@@ -166,48 +252,72 @@ interface GameBoardProps {
   gameId: string;
   gameState: GameState;
   players: Array<{ id: number; name: string; type: PlayerType }>;
-  aiTokens: Map<number, string>;
   onGameUpdate: () => void;
 }
 
-function GameBoard({ gameId, gameState, players, aiTokens, onGameUpdate }: GameBoardProps) {
+function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps) {
   const [actionLog, setActionLog] = useState<string[]>([]);
-  const [isProcessingAI, setIsProcessingAI] = useState(false);
+  const [aiStatus, setAIStatus] = useState<AITurnStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const aiProcessorRef = useRef<AIAgentProcessor | null>(null);
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const addToLog = useCallback((message: string) => {
     setActionLog(prev => [...prev.slice(-49), message]);
   }, []);
 
-  // Initialize AI processor
+  // Poll for AI status when AI is processing
   useEffect(() => {
-    const handleAIEvent = (event: AITurnEvent) => {
-      addToLog(`[${event.type.toUpperCase()}] ${event.message}`);
-      
-      if (event.type === 'turn_complete') {
-        // Refresh game state after AI turn completes
-        onGameUpdate();
+    const pollAIStatus = async () => {
+      try {
+        const status = await api.getAIStatus(gameId);
+        setAIStatus(status);
+
+        // Add new actions to log
+        if (status.recentActions.length > 0) {
+          const lastAction = status.recentActions[status.recentActions.length - 1];
+          addToLog(`🤖 ${lastAction.playerName}: ${lastAction.description}`);
+        }
+
+        // If AI finished, refresh game state
+        if (status.status === 'completed' || status.status === 'idle') {
+          if (!status.hasAIPendingTurns) {
+            onGameUpdate();
+            // Stop polling
+            if (pollingRef.current) {
+              clearInterval(pollingRef.current);
+              pollingRef.current = null;
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Failed to poll AI status:', err);
       }
     };
 
-    const processor = initializeAIProcessor(
-      gameId,
-      { provider: 'mock' },
-      handleAIEvent
-    );
+    // Start polling if AI is processing
+    if (aiStatus?.status === 'processing' || aiStatus?.hasAIPendingTurns) {
+      if (!pollingRef.current) {
+        pollingRef.current = setInterval(pollAIStatus, 1000);
+      }
+    }
 
-    // Set AI tokens
-    aiTokens.forEach((token, playerId) => {
-      processor.setAIToken(playerId, token);
-    });
+    return () => {
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+      }
+    };
+  }, [gameId, aiStatus?.status, aiStatus?.hasAIPendingTurns, addToLog, onGameUpdate]);
 
-    aiProcessorRef.current = processor;
-  }, [gameId, aiTokens, addToLog, onGameUpdate]);
+  // Initial AI status check
+  useEffect(() => {
+    api.getAIStatus(gameId).then(setAIStatus).catch(console.error);
+  }, [gameId]);
 
   const isMyTurn = gameState.currentPlayer === gameState.yourPlayerId;
   const currentPlayer = players.find(p => p.id === gameState.currentPlayer);
   const isCurrentPlayerAI = currentPlayer?.type === 'ai';
+  const isAIProcessing = aiStatus?.status === 'processing';
 
   const handleRollDice = async () => {
     try {
@@ -227,16 +337,38 @@ function GameBoard({ gameId, gameState, players, aiTokens, onGameUpdate }: GameB
       const result = await api.endTurn(gameId);
       addToLog(`You ended your turn. Next: ${result.nextPlayerName}`);
       
-      // If next player is AI, start processing AI turns
-      if (result.nextPlayerIsAI && aiProcessorRef.current) {
-        setIsProcessingAI(true);
+      // If AI processing started, begin polling
+      if (result.nextPlayerIsAI) {
         addToLog('🤖 AI players are taking their turns...');
+        // Refresh AI status to start polling
+        const status = await api.getAIStatus(gameId);
+        setAIStatus(status);
         
-        try {
-          await aiProcessorRef.current.processAllAITurns();
-        } finally {
-          setIsProcessingAI(false);
-          onGameUpdate();
+        // Start polling
+        if (!pollingRef.current) {
+          pollingRef.current = setInterval(async () => {
+            try {
+              const newStatus = await api.getAIStatus(gameId);
+              setAIStatus(newStatus);
+              
+              // Log new actions
+              if (newStatus.recentActions.length > 0) {
+                const lastAction = newStatus.recentActions[newStatus.recentActions.length - 1];
+                addToLog(`🤖 ${lastAction.playerName}: ${lastAction.description}`);
+              }
+              
+              // Stop when AI is done
+              if (!newStatus.hasAIPendingTurns && newStatus.status !== 'processing') {
+                if (pollingRef.current) {
+                  clearInterval(pollingRef.current);
+                  pollingRef.current = null;
+                }
+                onGameUpdate();
+              }
+            } catch (err) {
+              console.error('Polling error:', err);
+            }
+          }, 1000);
         }
       } else {
         onGameUpdate();
@@ -285,6 +417,7 @@ function GameBoard({ gameId, gameState, players, aiTokens, onGameUpdate }: GameB
         <div className="game-info">
           <span>Game: <code>{gameId}</code></span>
           <span>Phase: {phaseDisplay[gameState.phase] || gameState.phase}</span>
+          {aiStatus && <span>LLM: {aiStatus.llmProvider}</span>}
         </div>
       </div>
 
@@ -306,7 +439,7 @@ function GameBoard({ gameId, gameState, players, aiTokens, onGameUpdate }: GameB
               </div>
               {p.id === gameState.currentPlayer && (
                 <div className="turn-indicator">
-                  {isProcessingAI && p.type === 'ai' ? '⏳ Thinking...' : '▶ Current Turn'}
+                  {isAIProcessing && p.type === 'ai' ? '⏳ Thinking...' : '▶ Current Turn'}
                 </div>
               )}
             </div>
@@ -350,7 +483,7 @@ function GameBoard({ gameId, gameState, players, aiTokens, onGameUpdate }: GameB
           {/* Actions */}
           <div className="actions-panel">
             <h3>Actions</h3>
-            {isMyTurn && !isProcessingAI ? (
+            {isMyTurn && !isAIProcessing ? (
               <div className="action-buttons">
                 {gameState.phase === 'rolling' && (
                   <button onClick={handleRollDice} className="btn-action">
@@ -394,8 +527,15 @@ function GameBoard({ gameId, gameState, players, aiTokens, onGameUpdate }: GameB
               </div>
             ) : (
               <div className="waiting-message">
-                {isProcessingAI ? (
-                  <span>🤖 AI players are thinking...</span>
+                {isAIProcessing ? (
+                  <div>
+                    <span>🤖 AI players are thinking...</span>
+                    {aiStatus?.currentAIPlayerId !== undefined && aiStatus.currentAIPlayerId >= 0 && (
+                      <div className="ai-current">
+                        Current: {players.find(p => p.id === aiStatus.currentAIPlayerId)?.name || 'AI'}
+                      </div>
+                    )}
+                  </div>
                 ) : isCurrentPlayerAI ? (
                   <span>Waiting for {currentPlayer?.name}...</span>
                 ) : (
@@ -431,19 +571,10 @@ function App() {
   const [gameId, setGameId] = useState<string | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [players, setPlayers] = useState<Array<{ id: number; name: string; type: PlayerType }>>([]);
-  const [aiTokens, setAiTokens] = useState<Map<number, string>>(new Map());
 
-  const handleGameStarted = (
-    id: string, 
-    startInfo: StartGameResponse & { aiTokens?: Map<number, string> }
-  ) => {
+  const handleGameStarted = (id: string, startInfo: StartGameResponse) => {
     setGameId(id);
     setPlayers(startInfo.players);
-    if (startInfo.aiTokens) {
-      setAiTokens(startInfo.aiTokens);
-    }
-    
-    // Fetch initial game state
     refreshGameState(id);
   };
 
@@ -471,7 +602,6 @@ function App() {
           gameId={gameId}
           gameState={gameState}
           players={players}
-          aiTokens={aiTokens}
           onGameUpdate={handleGameUpdate}
         />
       )}

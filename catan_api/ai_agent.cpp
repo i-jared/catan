@@ -513,5 +513,674 @@ int AIPlayerManager::aiPlayerCount() const {
     return count;
 }
 
+// ============================================================================
+// AI TURN EXECUTOR - Server-side AI turn processing
+// ============================================================================
+
+AITurnExecutor::AITurnExecutor(Game* game, LLMConfigManager& llmConfig)
+    : game(game), llmConfig(llmConfig) {}
+
+AITurnExecutor::~AITurnExecutor() {
+    stopProcessing();
+}
+
+std::string AITurnExecutor::buildSystemPrompt() const {
+    return 
+        "You are playing a game of Catan. You are an AI player competing against other players. "
+        "Your goal is to win by being the first to reach 10 victory points. "
+        "Victory points come from: settlements (1 VP), cities (2 VP), longest road (2 VP), "
+        "largest army (2 VP), and victory point development cards (1 VP each). "
+        "\n\n"
+        "On your turn, you should:\n"
+        "1. If in 'rolling' phase: Roll the dice using roll_dice\n"
+        "2. If in 'robber' phase: Move the robber using move_robber\n"
+        "3. If in 'main_turn' phase: Build, trade, or play development cards, then end your turn\n"
+        "\n"
+        "Resource costs:\n"
+        "- Road: 1 wood + 1 brick\n"
+        "- Settlement: 1 wood + 1 brick + 1 wheat + 1 sheep\n"
+        "- City (upgrade): 2 wheat + 3 ore\n"
+        "- Development card: 1 wheat + 1 sheep + 1 ore\n"
+        "\n"
+        "Always use one of the available tools. Look at 'availableTools' to see what you can do. "
+        "When your turn is complete (in main_turn phase), use end_turn.";
+}
+
+std::string AITurnExecutor::buildUserMessage(const AIGameState& state) const {
+    return "Current game state:\n" + aiGameStateToJson(state) + 
+           "\n\nIt's your turn. Choose an action from availableTools.";
+}
+
+std::vector<LLMTool> AITurnExecutor::buildToolList() const {
+    std::vector<LLMTool> tools;
+    auto defs = getToolDefinitions();
+    for (const auto& def : defs) {
+        LLMTool tool;
+        tool.name = def.name;
+        tool.description = def.description;
+        tool.parametersSchema = def.parametersSchema;
+        tools.push_back(tool);
+    }
+    return tools;
+}
+
+// Simple JSON int parser
+static int parseJsonInt(const std::string& json, const std::string& key, int defaultValue = 0) {
+    std::string searchKey = "\"" + key + "\":";
+    size_t pos = json.find(searchKey);
+    if (pos == std::string::npos) return defaultValue;
+    pos += searchKey.length();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    size_t endPos = pos;
+    if (json[endPos] == '-') endPos++;
+    while (endPos < json.size() && std::isdigit(json[endPos])) endPos++;
+    if (endPos == pos) return defaultValue;
+    try {
+        return std::stoi(json.substr(pos, endPos - pos));
+    } catch (...) {
+        return defaultValue;
+    }
+}
+
+static std::string parseJsonStr(const std::string& json, const std::string& key) {
+    std::string searchKey = "\"" + key + "\":\"";
+    size_t pos = json.find(searchKey);
+    if (pos == std::string::npos) return "";
+    pos += searchKey.length();
+    size_t endPos = json.find("\"", pos);
+    if (endPos == std::string::npos) return "";
+    return json.substr(pos, endPos - pos);
+}
+
+ToolResult AITurnExecutor::executeToolCall(const LLMToolCall& toolCall, int playerId) {
+    ToolResult result;
+    result.success = false;
+    
+    if (!game) {
+        result.message = "No game context";
+        return result;
+    }
+    
+    Player* player = game->getPlayerById(playerId);
+    if (!player) {
+        result.message = "Player not found";
+        return result;
+    }
+    
+    const std::string& tool = toolCall.toolName;
+    const std::string& args = toolCall.arguments;
+    
+    // Building costs
+    static const ResourceHand ROAD_COST = {1, 1, 0, 0, 0};
+    static const ResourceHand SETTLEMENT_COST = {1, 1, 1, 1, 0};
+    static const ResourceHand CITY_COST = {0, 0, 2, 0, 3};
+    static const ResourceHand DEV_CARD_COST = {0, 0, 1, 1, 1};
+    
+    auto canAfford = [](const ResourceHand& have, const ResourceHand& cost) {
+        return have.wood >= cost.wood && have.brick >= cost.brick &&
+               have.wheat >= cost.wheat && have.sheep >= cost.sheep &&
+               have.ore >= cost.ore;
+    };
+    
+    auto subtractResources = [](ResourceHand& from, const ResourceHand& cost) {
+        from.wood -= cost.wood;
+        from.brick -= cost.brick;
+        from.wheat -= cost.wheat;
+        from.sheep -= cost.sheep;
+        from.ore -= cost.ore;
+    };
+    
+    if (tool == "roll_dice") {
+        if (game->phase != GamePhase::Rolling) {
+            result.message = "Cannot roll now";
+            return result;
+        }
+        
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_int_distribution<> die(1, 6);
+        
+        DiceRoll roll;
+        roll.die1 = die(gen);
+        roll.die2 = die(gen);
+        game->lastRoll = roll;
+        
+        if (roll.total() == 7) {
+            game->phase = GamePhase::Robber;
+            result.message = "Rolled " + std::to_string(roll.total()) + " - must move robber";
+        } else {
+            // Distribute resources
+            for (const auto& [coord, hex] : game->board.hexes) {
+                if (hex.numberToken == roll.total() && !hex.hasRobber) {
+                    Resource resource = hexTypeToResource(hex.type);
+                    if (resource == Resource::None) continue;
+                    
+                    for (int dir = 0; dir < 6; dir++) {
+                        VertexCoord vc{coord, dir};
+                        auto it = game->board.vertices.find(vc);
+                        if (it != game->board.vertices.end() && it->second.ownerPlayerId >= 0) {
+                            Player* owner = game->getPlayerById(it->second.ownerPlayerId);
+                            if (owner) {
+                                int amount = (it->second.building == Building::City) ? 2 : 1;
+                                owner->resources[resource] += amount;
+                            }
+                        }
+                    }
+                }
+            }
+            game->phase = GamePhase::MainTurn;
+            result.message = "Rolled " + std::to_string(roll.total());
+        }
+        result.success = true;
+        result.data = "{\"die1\":" + std::to_string(roll.die1) + 
+                      ",\"die2\":" + std::to_string(roll.die2) + 
+                      ",\"total\":" + std::to_string(roll.total()) + "}";
+    }
+    else if (tool == "end_turn") {
+        if (game->phase != GamePhase::MainTurn) {
+            result.message = "Cannot end turn in this phase";
+            return result;
+        }
+        
+        game->currentPlayerIndex = (game->currentPlayerIndex + 1) % game->players.size();
+        game->phase = GamePhase::Rolling;
+        game->devCardPlayedThisTurn = false;
+        
+        result.success = true;
+        result.message = "Turn ended";
+        result.data = "{\"nextPlayer\":" + std::to_string(game->currentPlayerIndex) + "}";
+    }
+    else if (tool == "build_road") {
+        if (game->phase != GamePhase::MainTurn) {
+            result.message = "Cannot build in this phase";
+            return result;
+        }
+        if (!canAfford(player->resources, ROAD_COST)) {
+            result.message = "Not enough resources";
+            return result;
+        }
+        if (player->roadsRemaining <= 0) {
+            result.message = "No roads remaining";
+            return result;
+        }
+        
+        int hexQ = parseJsonInt(args, "hexQ", 0);
+        int hexR = parseJsonInt(args, "hexR", 0);
+        int direction = parseJsonInt(args, "direction", 0);
+        
+        subtractResources(player->resources, ROAD_COST);
+        player->roadsRemaining--;
+        
+        EdgeCoord coord{{hexQ, hexR}, direction};
+        auto it = game->board.edges.find(coord);
+        if (it != game->board.edges.end()) {
+            it->second.hasRoad = true;
+            it->second.ownerPlayerId = player->id;
+        }
+        
+        result.success = true;
+        result.message = "Built road";
+    }
+    else if (tool == "build_settlement") {
+        if (game->phase != GamePhase::MainTurn) {
+            result.message = "Cannot build in this phase";
+            return result;
+        }
+        if (!canAfford(player->resources, SETTLEMENT_COST)) {
+            result.message = "Not enough resources";
+            return result;
+        }
+        if (player->settlementsRemaining <= 0) {
+            result.message = "No settlements remaining";
+            return result;
+        }
+        
+        int hexQ = parseJsonInt(args, "hexQ", 0);
+        int hexR = parseJsonInt(args, "hexR", 0);
+        int direction = parseJsonInt(args, "direction", 0);
+        
+        subtractResources(player->resources, SETTLEMENT_COST);
+        player->settlementsRemaining--;
+        
+        VertexCoord coord{{hexQ, hexR}, direction};
+        auto it = game->board.vertices.find(coord);
+        if (it != game->board.vertices.end()) {
+            it->second.building = Building::Settlement;
+            it->second.ownerPlayerId = player->id;
+        }
+        
+        result.success = true;
+        result.message = "Built settlement";
+    }
+    else if (tool == "build_city") {
+        if (game->phase != GamePhase::MainTurn) {
+            result.message = "Cannot build in this phase";
+            return result;
+        }
+        if (!canAfford(player->resources, CITY_COST)) {
+            result.message = "Not enough resources";
+            return result;
+        }
+        if (player->citiesRemaining <= 0) {
+            result.message = "No cities remaining";
+            return result;
+        }
+        
+        int hexQ = parseJsonInt(args, "hexQ", 0);
+        int hexR = parseJsonInt(args, "hexR", 0);
+        int direction = parseJsonInt(args, "direction", 0);
+        
+        VertexCoord coord{{hexQ, hexR}, direction};
+        auto it = game->board.vertices.find(coord);
+        if (it == game->board.vertices.end() || 
+            it->second.building != Building::Settlement ||
+            it->second.ownerPlayerId != player->id) {
+            result.message = "No settlement to upgrade";
+            return result;
+        }
+        
+        subtractResources(player->resources, CITY_COST);
+        player->citiesRemaining--;
+        player->settlementsRemaining++;
+        it->second.building = Building::City;
+        
+        result.success = true;
+        result.message = "Upgraded to city";
+    }
+    else if (tool == "buy_dev_card") {
+        if (game->phase != GamePhase::MainTurn) {
+            result.message = "Cannot buy in this phase";
+            return result;
+        }
+        if (!canAfford(player->resources, DEV_CARD_COST)) {
+            result.message = "Not enough resources";
+            return result;
+        }
+        if (game->devCardDeck.empty()) {
+            result.message = "No dev cards remaining";
+            return result;
+        }
+        
+        subtractResources(player->resources, DEV_CARD_COST);
+        
+        DevCardType card = game->devCardDeck.back();
+        game->devCardDeck.pop_back();
+        player->devCards.push_back(card);
+        
+        std::string cardName;
+        switch (card) {
+            case DevCardType::Knight: cardName = "knight"; break;
+            case DevCardType::VictoryPoint: cardName = "victory_point"; break;
+            case DevCardType::RoadBuilding: cardName = "road_building"; break;
+            case DevCardType::YearOfPlenty: cardName = "year_of_plenty"; break;
+            case DevCardType::Monopoly: cardName = "monopoly"; break;
+        }
+        
+        result.success = true;
+        result.message = "Bought " + cardName;
+        result.data = "{\"card\":\"" + cardName + "\"}";
+    }
+    else if (tool == "bank_trade") {
+        if (game->phase != GamePhase::MainTurn) {
+            result.message = "Cannot trade in this phase";
+            return result;
+        }
+        
+        std::string giveStr = parseJsonStr(args, "give");
+        std::string receiveStr = parseJsonStr(args, "receive");
+        
+        auto stringToResource = [](const std::string& name) -> Resource {
+            if (name == "wood") return Resource::Wood;
+            if (name == "brick") return Resource::Brick;
+            if (name == "wheat") return Resource::Wheat;
+            if (name == "sheep") return Resource::Sheep;
+            if (name == "ore") return Resource::Ore;
+            return Resource::None;
+        };
+        
+        Resource give = stringToResource(giveStr);
+        Resource receive = stringToResource(receiveStr);
+        
+        if (give == Resource::None || receive == Resource::None) {
+            result.message = "Invalid resources";
+            return result;
+        }
+        
+        int ratio = 4;
+        if (player->resources[give] < ratio) {
+            result.message = "Not enough resources";
+            return result;
+        }
+        
+        player->resources[give] -= ratio;
+        player->resources[receive] += 1;
+        
+        result.success = true;
+        result.message = "Traded " + giveStr + " for " + receiveStr;
+    }
+    else if (tool == "move_robber") {
+        if (game->phase != GamePhase::Robber) {
+            result.message = "Not in robber phase";
+            return result;
+        }
+        
+        int hexQ = parseJsonInt(args, "hexQ", 0);
+        int hexR = parseJsonInt(args, "hexR", 0);
+        int stealFrom = parseJsonInt(args, "stealFromPlayerId", -1);
+        
+        // Move robber
+        HexCoord oldLoc = game->board.robberLocation;
+        HexCoord newLoc{hexQ, hexR};
+        
+        auto oldIt = game->board.hexes.find(oldLoc);
+        if (oldIt != game->board.hexes.end()) {
+            oldIt->second.hasRobber = false;
+        }
+        
+        auto newIt = game->board.hexes.find(newLoc);
+        if (newIt != game->board.hexes.end()) {
+            newIt->second.hasRobber = true;
+        }
+        game->board.robberLocation = newLoc;
+        
+        // Steal from player
+        std::string stolenResource = "none";
+        if (stealFrom >= 0 && stealFrom < (int)game->players.size() && stealFrom != playerId) {
+            Player* victim = &game->players[stealFrom];
+            if (victim->resources.total() > 0) {
+                std::vector<Resource> available;
+                if (victim->resources.wood > 0) available.push_back(Resource::Wood);
+                if (victim->resources.brick > 0) available.push_back(Resource::Brick);
+                if (victim->resources.wheat > 0) available.push_back(Resource::Wheat);
+                if (victim->resources.sheep > 0) available.push_back(Resource::Sheep);
+                if (victim->resources.ore > 0) available.push_back(Resource::Ore);
+                
+                if (!available.empty()) {
+                    static std::random_device rd;
+                    static std::mt19937 gen(rd());
+                    std::uniform_int_distribution<> dis(0, available.size() - 1);
+                    Resource stolen = available[dis(gen)];
+                    victim->resources[stolen]--;
+                    player->resources[stolen]++;
+                    stolenResource = resourceToString(stolen);
+                }
+            }
+        }
+        
+        game->phase = GamePhase::MainTurn;
+        
+        result.success = true;
+        result.message = "Moved robber" + (stolenResource != "none" ? ", stole " + stolenResource : "");
+    }
+    else {
+        result.message = "Unknown tool: " + tool;
+    }
+    
+    return result;
+}
+
+std::string AITurnExecutor::describeAction(const std::string& toolName, const ToolResult& result) const {
+    if (toolName == "roll_dice") {
+        return "Rolled dice: " + result.message;
+    } else if (toolName == "end_turn") {
+        return "Ended turn";
+    } else if (toolName == "build_road") {
+        return "Built a road";
+    } else if (toolName == "build_settlement") {
+        return "Built a settlement";
+    } else if (toolName == "build_city") {
+        return "Upgraded to city";
+    } else if (toolName == "buy_dev_card") {
+        return "Bought development card";
+    } else if (toolName == "bank_trade") {
+        return result.message;
+    } else if (toolName == "move_robber") {
+        return result.message;
+    }
+    return toolName + ": " + result.message;
+}
+
+bool AITurnExecutor::startProcessing() {
+    if (status.load() == Status::Processing) {
+        return false;  // Already processing
+    }
+    
+    if (!hasAIPendingTurns()) {
+        return false;  // No AI turns to process
+    }
+    
+    shouldStop = false;
+    status = Status::Processing;
+    
+    // Start processing thread
+    if (processingThread.joinable()) {
+        processingThread.join();
+    }
+    
+    processingThread = std::thread([this]() {
+        processAITurns();
+    });
+    
+    return true;
+}
+
+void AITurnExecutor::stopProcessing() {
+    shouldStop = true;
+    if (processingThread.joinable()) {
+        processingThread.join();
+    }
+    status = Status::Idle;
+}
+
+std::vector<AIActionLogEntry> AITurnExecutor::getActionLog(size_t maxEntries) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (actionLog.size() <= maxEntries) {
+        return actionLog;
+    }
+    return std::vector<AIActionLogEntry>(
+        actionLog.end() - maxEntries, 
+        actionLog.end()
+    );
+}
+
+void AITurnExecutor::clearActionLog() {
+    std::lock_guard<std::mutex> lock(mutex);
+    actionLog.clear();
+}
+
+bool AITurnExecutor::hasAIPendingTurns() const {
+    if (!game || game->players.empty()) return false;
+    if (game->phase == GamePhase::WaitingForPlayers || 
+        game->phase == GamePhase::Finished) return false;
+    
+    if (game->currentPlayerIndex < 0 || 
+        game->currentPlayerIndex >= (int)game->players.size()) return false;
+    
+    return game->players[game->currentPlayerIndex].isAI();
+}
+
+std::string AITurnExecutor::statusToJson() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    std::ostringstream json;
+    json << "{";
+    json << "\"status\":\"";
+    switch (status.load()) {
+        case Status::Idle: json << "idle"; break;
+        case Status::Processing: json << "processing"; break;
+        case Status::Completed: json << "completed"; break;
+        case Status::Error: json << "error"; break;
+    }
+    json << "\",";
+    json << "\"currentAIPlayerId\":" << currentAIPlayerId << ",";
+    
+    if (!lastError.empty()) {
+        json << "\"error\":\"" << lastError << "\",";
+    }
+    
+    json << "\"hasAIPendingTurns\":" << (hasAIPendingTurns() ? "true" : "false") << ",";
+    json << "\"llmProvider\":\"" << llmConfig.getConfig().provider << "\",";
+    
+    // Recent actions
+    json << "\"recentActions\":[";
+    size_t startIdx = actionLog.size() > 10 ? actionLog.size() - 10 : 0;
+    for (size_t i = startIdx; i < actionLog.size(); i++) {
+        if (i > startIdx) json << ",";
+        const auto& entry = actionLog[i];
+        json << "{";
+        json << "\"playerId\":" << entry.playerId << ",";
+        json << "\"playerName\":\"" << entry.playerName << "\",";
+        json << "\"action\":\"" << entry.action << "\",";
+        json << "\"description\":\"" << entry.description << "\",";
+        json << "\"success\":" << (entry.success ? "true" : "false");
+        if (!entry.error.empty()) {
+            json << ",\"error\":\"" << entry.error << "\"";
+        }
+        json << "}";
+    }
+    json << "]";
+    
+    json << "}";
+    return json.str();
+}
+
+void AITurnExecutor::processAITurns() {
+    while (!shouldStop && hasAIPendingTurns()) {
+        int playerId = game->currentPlayerIndex;
+        currentAIPlayerId = playerId;
+        
+        if (!processSingleAITurn(playerId)) {
+            // Error occurred
+            status = Status::Error;
+            return;
+        }
+        
+        // Small delay between turns for rate limiting
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    currentAIPlayerId = -1;
+    status = Status::Completed;
+}
+
+bool AITurnExecutor::processSingleAITurn(int playerId) {
+    if (!game) return false;
+    
+    Player* player = game->getPlayerById(playerId);
+    if (!player || !player->isAI()) return false;
+    
+    LLMProvider* llm = llmConfig.getProvider();
+    if (!llm) {
+        lastError = "No LLM provider configured";
+        return false;
+    }
+    
+    std::string systemPrompt = buildSystemPrompt();
+    std::vector<LLMTool> tools = buildToolList();
+    std::vector<LLMMessage> messages;
+    
+    int maxActions = 20;  // Safety limit
+    int actionCount = 0;
+    
+    while (actionCount < maxActions && !shouldStop) {
+        actionCount++;
+        
+        // Check if still this AI's turn
+        if (game->currentPlayerIndex != playerId) {
+            break;  // Turn has ended
+        }
+        
+        // Get current state and build message
+        std::lock_guard<std::mutex> lock(game->mutex);
+        AIGameState state = getAIGameState(*game, playerId);
+        
+        if (!state.isMyTurn) {
+            break;  // Not our turn anymore
+        }
+        
+        // Build user message with current state
+        LLMMessage userMsg;
+        userMsg.role = LLMMessage::Role::User;
+        userMsg.content = buildUserMessage(state);
+        messages.push_back(userMsg);
+        
+        // Call LLM
+        LLMResponse llmResponse = llm->chat(messages, tools, systemPrompt);
+        
+        if (!llmResponse.success) {
+            lastError = "LLM call failed: " + llmResponse.error;
+            
+            AIActionLogEntry logEntry;
+            logEntry.playerId = playerId;
+            logEntry.playerName = player->name;
+            logEntry.action = "llm_error";
+            logEntry.description = lastError;
+            logEntry.success = false;
+            logEntry.error = llmResponse.error;
+            logEntry.timestamp = std::chrono::steady_clock::now();
+            
+            {
+                std::lock_guard<std::mutex> logLock(mutex);
+                actionLog.push_back(logEntry);
+            }
+            
+            // Fall back to mock behavior
+            llmResponse.toolCall = LLMToolCall{"end_turn", "{}"};
+            llmResponse.success = true;
+        }
+        
+        if (!llmResponse.toolCall) {
+            // No tool call, LLM gave text response - try to continue
+            LLMMessage assistantMsg;
+            assistantMsg.role = LLMMessage::Role::Assistant;
+            assistantMsg.content = llmResponse.textContent;
+            messages.push_back(assistantMsg);
+            continue;
+        }
+        
+        // Execute the tool
+        ToolResult result = executeToolCall(*llmResponse.toolCall, playerId);
+        
+        // Log the action
+        AIActionLogEntry logEntry;
+        logEntry.playerId = playerId;
+        logEntry.playerName = player->name;
+        logEntry.action = llmResponse.toolCall->toolName;
+        logEntry.description = describeAction(llmResponse.toolCall->toolName, result);
+        logEntry.success = result.success;
+        logEntry.error = result.success ? "" : result.message;
+        logEntry.timestamp = std::chrono::steady_clock::now();
+        
+        {
+            std::lock_guard<std::mutex> logLock(mutex);
+            actionLog.push_back(logEntry);
+        }
+        
+        // Add assistant message with tool call
+        LLMMessage assistantMsg;
+        assistantMsg.role = LLMMessage::Role::Assistant;
+        assistantMsg.toolCall = *llmResponse.toolCall;
+        messages.push_back(assistantMsg);
+        
+        // Add tool result message
+        LLMMessage toolResultMsg;
+        toolResultMsg.role = LLMMessage::Role::ToolResult;
+        toolResultMsg.content = result.success ? 
+            ("Success: " + result.message) : 
+            ("Error: " + result.message);
+        messages.push_back(toolResultMsg);
+        
+        // Check if turn ended
+        if (llmResponse.toolCall->toolName == "end_turn" && result.success) {
+            break;
+        }
+        
+        // Small delay between actions
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    
+    return true;
+}
+
 }  // namespace ai
 }  // namespace catan
