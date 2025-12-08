@@ -1,7 +1,8 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { api, type LLMConfig } from './api';
 import { useGameEvents, type ChatMessageEvent, type TradeProposedEvent, type TradeExecutedEvent, type TradeResponseEvent } from './useGameEvents';
-import type { GameState, StartGameResponse, ResourceHand, PlayerType, ChatMessage, TradeOffer } from './types';
+import type { GameState, ResourceHand, PlayerType, ChatMessage, TradeOffer, Player } from './types';
+import { HexBoard } from './HexBoard';
 import './App.css';
 
 // ============================================================================
@@ -97,7 +98,7 @@ function LLMConfigPanel({ config, onConfigChange }: LLMConfigPanelProps) {
 // ============================================================================
 
 interface LobbyProps {
-  onGameStarted: (gameId: string, gameState: StartGameResponse) => void;
+  onGameStarted: (gameId: string) => void;
 }
 
 function Lobby({ onGameStarted }: LobbyProps) {
@@ -177,8 +178,8 @@ function Lobby({ onGameStarted }: LobbyProps) {
   const startGame = async () => {
     if (!gameId) return;
     try {
-      const result = await api.startGame(gameId);
-      onGameStarted(gameId, result);
+      await api.startGame(gameId);
+      onGameStarted(gameId);
     } catch (err) {
       setError(`Failed to start game: ${err}`);
     }
@@ -623,10 +624,12 @@ function TradePanel({ gameId, playerId, playerResources, players, activeTrades, 
 // GAME BOARD COMPONENT
 // ============================================================================
 
+type BuildMode = 'none' | 'settlement' | 'road' | 'city';
+
 interface GameBoardProps {
   gameId: string;
   gameState: GameState;
-  players: Array<{ id: number; name: string; type: PlayerType }>;
+  players: Player[];
   onGameUpdate: () => void;
 }
 
@@ -637,6 +640,8 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
   const [llmProvider, setLLMProvider] = useState<string>('mock');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [activeTrades, setActiveTrades] = useState<TradeOffer[]>([]);
+  const [buildMode, setBuildMode] = useState<BuildMode>('none');
+  const [setupNeedsRoad, setSetupNeedsRoad] = useState(false);
 
   const addToLog = useCallback((message: string) => {
     setActionLog(prev => [...prev.slice(-49), message]);
@@ -644,7 +649,6 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
 
   const handleNewChatMessage = useCallback((msg: ChatMessage) => {
     setChatMessages(prev => {
-      // Avoid duplicates
       if (prev.some(m => m.id === msg.id)) return prev;
       return [...prev, msg];
     });
@@ -668,7 +672,6 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
       } catch (err) {
         console.error('Failed to load chat history:', err);
       }
-      
       await refreshTrades();
     };
     loadInitialData();
@@ -676,19 +679,13 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
 
   // Use SSE for real-time updates
   const { isConnected } = useGameEvents(gameId, {
-    onConnected: () => {
-      addToLog('📡 Connected to game events');
-    },
-    onDisconnected: () => {
-      addToLog('📡 Disconnected from game events');
-    },
+    onConnected: () => addToLog('📡 Connected to game events'),
+    onDisconnected: () => addToLog('📡 Disconnected from game events'),
     onAIThinking: (event) => {
       setAIThinking({ playerId: event.playerId, playerName: event.playerName });
       addToLog(`🤔 ${event.playerName} is thinking...`);
     },
-    onAIAction: (event) => {
-      addToLog(`🤖 ${event.playerName}: ${event.description}`);
-    },
+    onAIAction: (event) => addToLog(`🤖 ${event.playerName}: ${event.description}`),
     onAITurnComplete: () => {
       setAIThinking(null);
       addToLog('✅ AI turns completed');
@@ -703,7 +700,6 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
       addToLog(`🔄 Turn changed to ${event.playerName}`);
       onGameUpdate();
     },
-    // Chat events
     onChatMessage: (event: ChatMessageEvent) => {
       handleNewChatMessage({
         id: event.messageId,
@@ -714,7 +710,6 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
         type: event.type as ChatMessage['type'],
       });
     },
-    // Trade events
     onTradeProposed: (event: TradeProposedEvent) => {
       setActiveTrades(prev => [...prev, {
         id: event.tradeId,
@@ -728,12 +723,8 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
       }]);
       addToLog(`📦 ${event.fromPlayerName} proposed a trade`);
     },
-    onTradeAccepted: (event: TradeResponseEvent) => {
-      addToLog(`✅ ${event.responderName} accepted trade #${event.tradeId}`);
-    },
-    onTradeRejected: (event: TradeResponseEvent) => {
-      addToLog(`❌ ${event.responderName} rejected trade #${event.tradeId}`);
-    },
+    onTradeAccepted: (event: TradeResponseEvent) => addToLog(`✅ ${event.responderName} accepted trade`),
+    onTradeRejected: (event: TradeResponseEvent) => addToLog(`❌ ${event.responderName} rejected trade`),
     onTradeExecuted: (event: TradeExecutedEvent) => {
       setActiveTrades(prev => prev.filter(t => t.id !== event.tradeId));
       addToLog(`🤝 Trade completed between ${event.player1Name} and ${event.player2Name}`);
@@ -747,23 +738,24 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
 
   // Load LLM provider info
   useEffect(() => {
-    api.getLLMConfig().then(config => {
-      setLLMProvider(config.provider);
-    }).catch(console.error);
+    api.getLLMConfig().then(config => setLLMProvider(config.provider)).catch(console.error);
   }, []);
 
   const isMyTurn = gameState.currentPlayer === gameState.yourPlayerId;
   const currentPlayer = players.find(p => p.id === gameState.currentPlayer);
-  const isCurrentPlayerAI = currentPlayer?.type === 'ai';
   const isAIProcessing = aiThinking !== null;
+  const isSetupPhase = gameState.phase === 'setup' || gameState.phase === 'setup_reverse';
+  const hasWinner = gameState.winner !== undefined && gameState.winner >= 0;
+  const winnerPlayer = hasWinner ? players.find(p => p.id === gameState.winner) : null;
 
+  const resources: ResourceHand = gameState.resources || { wood: 0, brick: 0, wheat: 0, sheep: 0, ore: 0 };
+
+  // Action handlers
   const handleRollDice = async () => {
     try {
       const result = await api.rollDice(gameId);
-      addToLog(`You rolled ${result.total} (${result.die1} + ${result.die2})`);
-      if (result.robber) {
-        addToLog('⚠️ Rolled a 7! Move the robber.');
-      }
+      addToLog(`🎲 You rolled ${result.total} (${result.die1} + ${result.die2})`);
+      if (result.robber) addToLog('⚠️ Rolled a 7! Move the robber.');
       onGameUpdate();
     } catch (err) {
       setError(`${err}`);
@@ -773,14 +765,10 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
   const handleEndTurn = async () => {
     try {
       const result = await api.endTurn(gameId);
-      addToLog(`You ended your turn. Next: ${result.nextPlayerName}`);
-      
-      // If AI processing started, the SSE events will handle updates
-      if (result.nextPlayerIsAI) {
-        addToLog('🤖 AI players are taking their turns...');
-      } else {
-        onGameUpdate();
-      }
+      addToLog(`⏭️ You ended your turn. Next: ${result.nextPlayerName}`);
+      setBuildMode('none');
+      if (result.nextPlayerIsAI) addToLog('🤖 AI players are taking their turns...');
+      else onGameUpdate();
     } catch (err) {
       setError(`${err}`);
     }
@@ -789,7 +777,7 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
   const handleBuyDevCard = async () => {
     try {
       const result = await api.buyDevCard(gameId);
-      addToLog(`Bought a ${result.card} card!`);
+      addToLog(`🃏 Bought a ${result.card} card!`);
       onGameUpdate();
     } catch (err) {
       setError(`${err}`);
@@ -798,19 +786,101 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
 
   const handleBankTrade = async (give: string, receive: string) => {
     try {
-      await api.bankTrade(gameId, give, receive);
-      addToLog(`Traded 4 ${give} for 1 ${receive}`);
+      const result = await api.bankTrade(gameId, give, receive);
+      addToLog(`💱 Traded ${result.traded.gaveAmount} ${give} for 1 ${receive}`);
       onGameUpdate();
     } catch (err) {
       setError(`${err}`);
     }
   };
 
-  const resources: ResourceHand = gameState.resources || {
-    wood: 0, brick: 0, wheat: 0, sheep: 0, ore: 0
+  // Setup phase handlers
+  const handleSetupSettlement = async (hexQ: number, hexR: number, direction: number) => {
+    try {
+      await api.setupPlaceSettlement(gameId, hexQ, hexR, direction);
+      addToLog(`🏠 Placed settlement - now place a road`);
+      setSetupNeedsRoad(true);
+      setBuildMode('road');
+      onGameUpdate();
+    } catch (err) {
+      setError(`${err}`);
+    }
   };
 
+  const handleSetupRoad = async (hexQ: number, hexR: number, direction: number) => {
+    try {
+      const result = await api.setupPlaceRoad(gameId, hexQ, hexR, direction);
+      addToLog(`🛤️ Placed road`);
+      setSetupNeedsRoad(false);
+      setBuildMode('none');
+      if (result.setupComplete) addToLog('🎉 Setup complete! Game starting...');
+      onGameUpdate();
+    } catch (err) {
+      setError(`${err}`);
+    }
+  };
+
+  // Build handlers for main game
+  const handleBuildSettlement = async (hexQ: number, hexR: number, direction: number) => {
+    try {
+      await api.buySettlement(gameId, hexQ, hexR, direction);
+      addToLog(`🏠 Built settlement`);
+      setBuildMode('none');
+      onGameUpdate();
+    } catch (err) {
+      setError(`${err}`);
+    }
+  };
+
+  const handleBuildRoad = async (hexQ: number, hexR: number, direction: number) => {
+    try {
+      await api.buyRoad(gameId, hexQ, hexR, direction);
+      addToLog(`🛤️ Built road`);
+      setBuildMode('none');
+      onGameUpdate();
+    } catch (err) {
+      setError(`${err}`);
+    }
+  };
+
+  const handleBuildCity = async (hexQ: number, hexR: number, direction: number) => {
+    try {
+      await api.buyCity(gameId, hexQ, hexR, direction);
+      addToLog(`🏰 Built city`);
+      setBuildMode('none');
+      onGameUpdate();
+    } catch (err) {
+      setError(`${err}`);
+    }
+  };
+
+  // Board click handlers
+  const handleVertexClick = (hexQ: number, hexR: number, direction: number) => {
+    if (isSetupPhase && !setupNeedsRoad) {
+      handleSetupSettlement(hexQ, hexR, direction);
+    } else if (buildMode === 'settlement') {
+      handleBuildSettlement(hexQ, hexR, direction);
+    } else if (buildMode === 'city') {
+      handleBuildCity(hexQ, hexR, direction);
+    }
+  };
+
+  const handleEdgeClick = (hexQ: number, hexR: number, direction: number) => {
+    if (isSetupPhase && setupNeedsRoad) {
+      handleSetupRoad(hexQ, hexR, direction);
+    } else if (buildMode === 'road') {
+      handleBuildRoad(hexQ, hexR, direction);
+    }
+  };
+
+  // Determine current build mode for the board
+  const currentBuildMode: BuildMode = isSetupPhase 
+    ? (setupNeedsRoad ? 'road' : 'settlement')
+    : buildMode;
+
   const phaseDisplay: Record<string, string> = {
+    'setup': '🏗️ Setup Phase',
+    'setup_reverse': '🏗️ Setup Phase (Round 2)',
     'rolling': '🎲 Roll Dice',
     'main_turn': '🏗️ Main Phase',
     'robber': '🦹 Move Robber',
@@ -818,10 +888,15 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
     'finished': '🏆 Game Over',
   };
 
+  // Check if player can afford builds
+  const canAffordRoad = resources.wood >= 1 && resources.brick >= 1;
+  const canAffordSettlement = resources.wood >= 1 && resources.brick >= 1 && resources.wheat >= 1 && resources.sheep >= 1;
+  const canAffordCity = resources.wheat >= 2 && resources.ore >= 3;
+
   return (
     <div className="game-board">
       <div className="game-header">
-        <h2>Catan</h2>
+        <h2>🎲 Catan</h2>
         <div className="game-info">
           <span>Game: <code>{gameId}</code></span>
           <span>Phase: {phaseDisplay[gameState.phase] || gameState.phase}</span>
@@ -832,23 +907,44 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
         </div>
       </div>
 
-      {error && <div className="error">{error}</div>}
+      {error && <div className="error" onClick={() => setError(null)}>{error}</div>}
 
-      <div className="game-content">
-        {/* Left Sidebar - Players and Trade */}
+      {/* Winner Banner */}
+      {hasWinner && (
+        <div className="winner-banner">
+          <h2>🎉 {winnerPlayer?.name} Wins! 🏆</h2>
+          <p>Congratulations on reaching 10 victory points!</p>
+        </div>
+      )}
+
+      {/* Setup Phase Banner */}
+      {isSetupPhase && isMyTurn && !isAIProcessing && (
+        <div className="setup-phase-banner">
+          <h3>Setup Phase {gameState.phase === 'setup_reverse' ? '(Round 2)' : '(Round 1)'}</h3>
+          <p className="setup-instruction">
+            {setupNeedsRoad 
+              ? '🛤️ Click an edge next to your settlement to place a road'
+              : '🏠 Click a vertex on the board to place your settlement'}
+          </p>
+        </div>
+      )}
+
+      <div className="game-content-with-board">
+        {/* Left Sidebar */}
         <div className="left-sidebar">
-          {/* Players Panel */}
           <div className="players-panel">
             <h3>Players</h3>
             {players.map(p => (
-              <div 
-                key={p.id} 
-                className={`player-card ${p.id === gameState.currentPlayer ? 'active' : ''} ${p.type}`}
-              >
+              <div key={p.id} className={`player-card ${p.id === gameState.currentPlayer ? 'active' : ''} ${p.type}`}>
                 <div className="player-header">
                   <span>{p.type === 'ai' ? '🤖' : '👤'}</span>
                   <span className="player-name">{p.name}</span>
                   {p.id === gameState.yourPlayerId && <span className="you-badge">You</span>}
+                </div>
+                <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)', marginTop: '0.25rem' }}>
+                  {p.victoryPoints} VP
+                  {p.hasLongestRoad && ' 🛤️'}
+                  {p.hasLargestArmy && ' ⚔️'}
                 </div>
                 {p.id === gameState.currentPlayer && (
                   <div className="turn-indicator">
@@ -859,93 +955,122 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
             ))}
           </div>
 
-          {/* Trade Panel */}
           <TradePanel
             gameId={gameId}
             playerId={gameState.yourPlayerId}
             playerResources={resources}
-            players={players}
+            players={players.map(p => ({ id: p.id, name: p.name, type: p.type }))}
             activeTrades={activeTrades}
             onTradeUpdate={refreshTrades}
           />
         </div>
 
-        {/* Main Game Area */}
-        <div className="main-area">
-          {/* Resources */}
+        {/* Center Area with Board */}
+        <div className="center-area">
+          {/* Hex Board */}
+          {gameState.hexes && gameState.hexes.length > 0 && (
+            <HexBoard
+              hexes={gameState.hexes}
+              vertices={gameState.vertices || []}
+              edges={gameState.edges || []}
+              ports={gameState.ports || []}
+              robberLocation={gameState.robberLocation || { q: 0, r: 0 }}
+              players={players}
+              yourPlayerId={gameState.yourPlayerId}
+              validSettlementLocations={isMyTurn ? gameState.validSettlementLocations : []}
+              validRoadLocations={isMyTurn ? gameState.validRoadLocations : []}
+              validCityLocations={isMyTurn ? gameState.validCityLocations : []}
+              onVertexClick={handleVertexClick}
+              onEdgeClick={handleEdgeClick}
+              buildMode={isMyTurn ? currentBuildMode : 'none'}
+            />
+          )}
+
+          {/* Resources Panel */}
           <div className="resources-panel">
             <h3>Your Resources</h3>
             <div className="resources-grid">
-              <div className="resource wood">
-                <span className="emoji">🪵</span>
-                <span className="count">{resources.wood}</span>
-                <span className="name">Wood</span>
-              </div>
-              <div className="resource brick">
-                <span className="emoji">🧱</span>
-                <span className="count">{resources.brick}</span>
-                <span className="name">Brick</span>
-              </div>
-              <div className="resource wheat">
-                <span className="emoji">🌾</span>
-                <span className="count">{resources.wheat}</span>
-                <span className="name">Wheat</span>
-              </div>
-              <div className="resource sheep">
-                <span className="emoji">🐑</span>
-                <span className="count">{resources.sheep}</span>
-                <span className="name">Sheep</span>
-              </div>
-              <div className="resource ore">
-                <span className="emoji">💎</span>
-                <span className="count">{resources.ore}</span>
-                <span className="name">Ore</span>
-              </div>
+              {(['wood', 'brick', 'wheat', 'sheep', 'ore'] as const).map(res => (
+                <div key={res} className={`resource ${res}`}>
+                  <span className="emoji">
+                    {res === 'wood' ? '🪵' : res === 'brick' ? '🧱' : res === 'wheat' ? '🌾' : res === 'sheep' ? '🐑' : '💎'}
+                  </span>
+                  <span className="count">{resources[res]}</span>
+                  <span className="name">{res.charAt(0).toUpperCase() + res.slice(1)}</span>
+                </div>
+              ))}
             </div>
           </div>
 
-          {/* Actions */}
+          {/* Actions Panel */}
           <div className="actions-panel">
             <h3>Actions</h3>
-            {isMyTurn && !isAIProcessing ? (
+            {isMyTurn && !isAIProcessing && !isSetupPhase ? (
               <div className="action-buttons">
                 {gameState.phase === 'rolling' && (
-                  <button onClick={handleRollDice} className="btn-action">
-                    🎲 Roll Dice
-                  </button>
+                  <button onClick={handleRollDice} className="btn-action">🎲 Roll Dice</button>
                 )}
                 {gameState.phase === 'main_turn' && (
                   <>
+                    {/* Build Mode Panel */}
+                    <div className="build-mode-panel">
+                      <h4>Build</h4>
+                      <div className="build-mode-buttons">
+                        <button 
+                          className={`btn-secondary ${buildMode === 'road' ? 'active' : ''}`}
+                          onClick={() => setBuildMode(buildMode === 'road' ? 'none' : 'road')}
+                          disabled={!canAffordRoad || !gameState.validRoadLocations?.length}
+                        >
+                          🛤️ Road
+                          <div className="build-cost">1🪵 1🧱</div>
+                        </button>
+                        <button 
+                          className={`btn-secondary ${buildMode === 'settlement' ? 'active' : ''}`}
+                          onClick={() => setBuildMode(buildMode === 'settlement' ? 'none' : 'settlement')}
+                          disabled={!canAffordSettlement || !gameState.validSettlementLocations?.length}
+                        >
+                          🏠 Settlement
+                          <div className="build-cost">1🪵 1🧱 1🌾 1🐑</div>
+                        </button>
+                        <button 
+                          className={`btn-secondary ${buildMode === 'city' ? 'active' : ''}`}
+                          onClick={() => setBuildMode(buildMode === 'city' ? 'none' : 'city')}
+                          disabled={!canAffordCity || !gameState.validCityLocations?.length}
+                        >
+                          🏰 City
+                          <div className="build-cost">2🌾 3💎</div>
+                        </button>
+                      </div>
+                      {buildMode !== 'none' && (
+                        <p style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)', marginTop: '0.5rem' }}>
+                          Click on the board to place your {buildMode}
+                        </p>
+                      )}
+                    </div>
+
                     <button 
                       onClick={handleBuyDevCard} 
                       className="btn-action"
                       disabled={resources.wheat < 1 || resources.sheep < 1 || resources.ore < 1}
                     >
-                      🃏 Buy Dev Card
+                      🃏 Buy Dev Card (1🌾 1🐑 1💎)
                     </button>
+
                     <div className="trade-section">
-                      <span className="trade-label">Bank Trade (4:1):</span>
+                      <span className="trade-label">Bank Trade:</span>
                       {(['wood', 'brick', 'wheat', 'sheep', 'ore'] as const).map(res => (
-                        resources[res] >= 4 && (
-                          <select 
-                            key={res}
-                            onChange={(e) => e.target.value && handleBankTrade(res, e.target.value)}
-                            defaultValue=""
-                          >
+                        resources[res] >= 2 && (
+                          <select key={res} onChange={(e) => e.target.value && handleBankTrade(res, e.target.value)} defaultValue="">
                             <option value="">Trade {res}...</option>
-                            {(['wood', 'brick', 'wheat', 'sheep', 'ore'] as const)
-                              .filter(r => r !== res)
-                              .map(r => (
-                                <option key={r} value={r}>Get {r}</option>
-                              ))
-                            }
+                            {(['wood', 'brick', 'wheat', 'sheep', 'ore'] as const).filter(r => r !== res).map(r => (
+                              <option key={r} value={r}>Get {r}</option>
+                            ))}
                           </select>
                         )
                       ))}
                     </div>
-                    <button onClick={handleEndTurn} className="btn-action end-turn">
-                      ⏭️ End Turn
-                    </button>
+
+                    <button onClick={handleEndTurn} className="btn-action end-turn">⏭️ End Turn</button>
                   </>
                 )}
               </div>
@@ -954,14 +1079,10 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
                 {isAIProcessing ? (
                   <div>
                     <span>🤖 AI players are thinking...</span>
-                    {aiThinking && (
-                      <div className="ai-current">
-                        Current: {aiThinking.playerName}
-                      </div>
-                    )}
+                    {aiThinking && <div className="ai-current">Current: {aiThinking.playerName}</div>}
                   </div>
-                ) : isCurrentPlayerAI ? (
-                  <span>Waiting for {currentPlayer?.name}...</span>
+                ) : isSetupPhase && isMyTurn ? (
+                  <span>Place your buildings on the board above</span>
                 ) : (
                   <span>Waiting for {currentPlayer?.name}'s turn...</span>
                 )}
@@ -973,12 +1094,8 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
           <div className="log-panel">
             <h3>Game Log</h3>
             <div className="log-entries">
-              {actionLog.map((entry, i) => (
-                <div key={i} className="log-entry">{entry}</div>
-              ))}
-              {actionLog.length === 0 && (
-                <div className="log-empty">Game started! Roll the dice to begin.</div>
-              )}
+              {actionLog.map((entry, i) => <div key={i} className="log-entry">{entry}</div>)}
+              {actionLog.length === 0 && <div className="log-empty">Game started!</div>}
             </div>
           </div>
         </div>
@@ -988,7 +1105,7 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
           <ChatPanel
             gameId={gameId}
             playerId={gameState.yourPlayerId}
-            players={players}
+            players={players.map(p => ({ id: p.id, name: p.name, type: p.type }))}
             messages={chatMessages}
             onNewMessage={handleNewChatMessage}
           />
@@ -1005,11 +1122,9 @@ function GameBoard({ gameId, gameState, players, onGameUpdate }: GameBoardProps)
 function App() {
   const [gameId, setGameId] = useState<string | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
-  const [players, setPlayers] = useState<Array<{ id: number; name: string; type: PlayerType }>>([]);
 
-  const handleGameStarted = (id: string, startInfo: StartGameResponse) => {
+  const handleGameStarted = (id: string) => {
     setGameId(id);
-    setPlayers(startInfo.players);
     refreshGameState(id);
   };
 
@@ -1021,6 +1136,22 @@ function App() {
       console.error('Failed to fetch game state:', err);
     }
   };
+  
+  // Get players from game state (includes VP and other info)
+  const players: Player[] = gameState?.players?.map(p => ({
+    id: p.id,
+    name: p.name,
+    type: p.type,
+    resourceCount: p.resourceCount,
+    devCardCount: p.devCardCount,
+    knightsPlayed: p.knightsPlayed,
+    hasLongestRoad: p.hasLongestRoad,
+    hasLargestArmy: p.hasLargestArmy,
+    victoryPoints: p.victoryPoints,
+    settlementsRemaining: p.settlementsRemaining,
+    citiesRemaining: p.citiesRemaining,
+    roadsRemaining: p.roadsRemaining,
+  })) || [];
 
   const handleGameUpdate = () => {
     if (gameId) {
